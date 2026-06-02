@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Check manifest version
+        run: |
+          node -e "const fs = require('fs'); const version = JSON.parse(fs.readFileSync('manifest.json', 'utf8')).version; if (version !== process.env.GITHUB_REF_NAME) { throw new Error(`manifest version ${version} does not match tag ${process.env.GITHUB_REF_NAME}`); }"
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Local Zotero Mirror $GITHUB_REF_NAME"
