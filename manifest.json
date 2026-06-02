@@ -1,0 +1,10 @@
+{
+  "id": "local-zotero-mirror",
+  "name": "Local Zotero Mirror",
+  "version": "0.1.1",
+  "minAppVersion": "1.5.0",
+  "description": "Synchronize Zotero collections, paper metadata, and native notes into local Markdown notes.",
+  "author": "mappedinfo",
+  "authorUrl": "https://github.com/mappedinfo",
+  "isDesktopOnly": true
+}

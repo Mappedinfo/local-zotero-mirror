@@ -1,0 +1,19 @@
+{
+  "name": "local-zotero-mirror",
+  "version": "0.1.1",
+  "type": "module",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "test": "node --experimental-transform-types --test tests/*.test.ts",
+    "build": "npm run build:shared && node esbuild.config.mjs",
+    "build:shared": "tsc -p packages/shared/tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "^1.7.2",
+    "typescript": "^5.8.0"
+  }
+}

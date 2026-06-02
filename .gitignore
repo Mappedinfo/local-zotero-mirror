@@ -1,0 +1,4 @@
+node_modules/
+packages/shared/dist/
+main.js
+.DS_Store

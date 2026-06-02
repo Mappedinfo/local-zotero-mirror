@@ -1,0 +1,5 @@
+.local-zotero-mirror-status {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-top: 0.5rem;
+}
