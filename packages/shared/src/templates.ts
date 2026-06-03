@@ -1,4 +1,4 @@
-import { creatorDisplayName, stripMarkdownExtension } from "./format.ts";
+import { creatorDisplayName, normalizeObsidianTags, stripMarkdownExtension } from "./format.ts";
 import { mergeManagedFrontmatter, type YamlValue } from "./frontmatter.ts";
 import type { ZoteroCollection, ZoteroItem, ZoteroNativeNote } from "./types.ts";
 
@@ -28,7 +28,8 @@ export function buildManagedFields(
     doi: item.doi,
     url: item.url,
     collections: collectionLabels,
-    tags: item.tags,
+    tags: normalizeObsidianTags(item.tags),
+    zotero_tags: item.tags,
     zotero_uri: item.zoteroUri,
     pdf_uri: pdfUri,
     zotero_version: item.version,

@@ -10,6 +10,8 @@ It is designed to work with the companion Zotero plugin, [Local Zotero Bridge](h
 - Regenerates collection index notes that link to canonical paper notes.
 - Preserves user-written note sections outside managed blocks.
 - Migrates Zotero native notes into a protected Markdown block.
+- Writes a local full-text search index for Zotero-side Obsidian note search.
+- Converts Zotero source tags into Obsidian-safe `zotero/...` tags while preserving originals in `zotero_tags`.
 - Supports opening Zotero items and PDF attachments from Obsidian commands and context menus.
 
 ## Development

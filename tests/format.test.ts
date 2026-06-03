@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ensureUniquePath, makePaperFileName, sanitizePathSegment } from "../packages/shared/src/index.ts";
+import {
+  ensureUniquePath,
+  makePaperFileName,
+  normalizeObsidianTag,
+  normalizeObsidianTags,
+  sanitizePathSegment
+} from "../packages/shared/src/index.ts";
 import type { ZoteroItem } from "../packages/shared/src/index.ts";
 
 test("sanitizePathSegment removes invalid path characters", () => {
@@ -33,4 +39,14 @@ test("ensureUniquePath accounts for case-insensitive filesystem collisions", () 
 
   assert.equal(ensureUniquePath("Zotero/Papers/Paper.md", used), "Zotero/Papers/Paper.md");
   assert.equal(ensureUniquePath("Zotero/Papers/paper.md", used), "Zotero/Papers/paper 2.md");
+});
+
+test("normalizeObsidianTag converts Zotero tags into valid Obsidian tags", () => {
+  assert.equal(normalizeObsidianTag("Health Services Accessibility"), "zotero/health-services-accessibility");
+  assert.equal(normalizeObsidianTag("Child, Preschool"), "zotero/child-preschool");
+  assert.equal(normalizeObsidianTag("#New York"), "zotero/new-york");
+  assert.equal(normalizeObsidianTag("2026"), "zotero/tag-2026");
+  assert.deepEqual(normalizeObsidianTags(["Health Services Accessibility", "health/services/accessibility"]), [
+    "zotero/health-services-accessibility"
+  ]);
 });

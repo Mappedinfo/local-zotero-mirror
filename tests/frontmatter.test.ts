@@ -19,6 +19,7 @@ test("mergeManagedFrontmatter preserves user fields and body", () => {
     zotero_key: "NEW",
     title: "Updated title",
     tags: ["zotero", "paper"],
+    zotero_tags: ["Zotero Source Tag"],
     zotero_deleted: false
   });
 
@@ -26,6 +27,7 @@ test("mergeManagedFrontmatter preserves user fields and body", () => {
   assert.match(merged, /aliases:\n  - "custom alias"/);
   assert.match(merged, /zotero_key: "NEW"/);
   assert.doesNotMatch(merged, /zotero_key: "OLD"/);
+  assert.match(merged, /zotero_tags:\n  - "Zotero Source Tag"/);
   assert.match(merged, /## Summary\nMy own note\./);
   assert.equal(readFrontmatterString(merged, "zotero_key"), "NEW");
 });

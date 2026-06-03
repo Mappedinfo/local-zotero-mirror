@@ -85,3 +85,33 @@ export function dirname(path: string): string {
 export function stripMarkdownExtension(path: string): string {
   return path.endsWith(".md") ? path.slice(0, -3) : path;
 }
+
+export function normalizeObsidianTag(value: string, prefix = "zotero"): string | null {
+  const cleaned = value
+    .normalize("NFKC")
+    .replace(/^#+/, "")
+    .toLocaleLowerCase("en-US")
+    .replace(/['"`]/g, "")
+    .replace(/&/g, " and ")
+    .replace(/[^0-9a-z\u00c0-\uFFFF]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-+/g, "-");
+
+  if (!cleaned) return null;
+  const tag = /^\d+$/.test(cleaned) ? `tag-${cleaned}` : cleaned;
+  return prefix ? `${prefix}/${tag}` : tag;
+}
+
+export function normalizeObsidianTags(values: string[], prefix = "zotero"): string[] {
+  const output: string[] = [];
+  const seen = new Set<string>();
+
+  for (const value of values) {
+    const tag = normalizeObsidianTag(value, prefix);
+    if (!tag || seen.has(tag)) continue;
+    seen.add(tag);
+    output.push(tag);
+  }
+
+  return output;
+}

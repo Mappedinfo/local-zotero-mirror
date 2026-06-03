@@ -124,6 +124,7 @@ export interface SyncOperation {
     | "unchanged-standalone-note"
     | "write-index"
     | "write-obsidian-index"
+    | "write-search-index"
     | "mark-deleted"
     | "mark-note-deleted"
     | "archive-deleted";
@@ -143,6 +144,7 @@ export interface SyncResult {
   standaloneNotesUnchanged: number;
   indexesWritten: number;
   obsidianIndexWritten: number;
+  searchIndexWritten: number;
   deletedMarked: number;
   standaloneNotesDeletedMarked: number;
   archived: number;
@@ -177,4 +179,24 @@ export interface ZoteroObsidianIndex {
   standaloneNotesFolderName: string;
   items: Record<string, ZoteroObsidianIndexItem>;
   standaloneNotes: Record<string, ZoteroObsidianIndexStandaloneNote>;
+}
+
+export interface ZoteroObsidianSearchIndexEntry {
+  kind: "paper" | "standalone-note";
+  path: string;
+  title: string;
+  citekey?: string;
+  year?: string;
+  itemKey?: string;
+  noteKey?: string;
+  zoteroUri?: string;
+  updatedAt: string;
+  content: string;
+}
+
+export interface ZoteroObsidianSearchIndex {
+  schemaVersion: number;
+  generatedAt: string;
+  targetFolder: string;
+  entries: ZoteroObsidianSearchIndexEntry[];
 }

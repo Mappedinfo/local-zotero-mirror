@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   DEFAULT_SYNC_SETTINGS,
   OBSIDIAN_ZOTERO_INDEX_FILE_NAME,
+  OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME,
   htmlToMarkdown,
   syncSnapshotToStore,
   type NoteRecord,
@@ -50,6 +51,7 @@ test("syncSnapshotToStore creates canonical paper notes and collection indexes",
   assert.equal(result.created, 2);
   assert.equal(result.indexesWritten, 2);
   assert.equal(result.obsidianIndexWritten, 1);
+  assert.equal(result.searchIndexWritten, 1);
 
   const paperPaths = [...store.files.keys()].filter((path) => path.includes("/Papers/"));
   assert.equal(paperPaths.length, 2);
@@ -64,6 +66,19 @@ test("syncSnapshotToStore creates canonical paper notes and collection indexes",
 
   const obsidianIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`)!);
   assert.equal(obsidianIndex.items.I1.path, "Zotero/Papers/2024 - Smith - Multi Collection Paper.md");
+
+  const searchIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`)!);
+  assert.equal(searchIndex.schemaVersion, 1);
+  assert.equal(searchIndex.entries.length, 2);
+  assert.equal(searchIndex.entries[0].kind, "paper");
+  assert.equal(searchIndex.entries[0].itemKey, "I1");
+  assert.match(searchIndex.entries[0].content, /Multi Collection Paper/);
+  assert.doesNotMatch(JSON.stringify(searchIndex), /Path: Planning \/ Scenario Assessment/);
+
+  const paperContent = store.files.get("Zotero/Papers/2024 - Smith - Multi Collection Paper.md")!;
+  assert.match(paperContent, /tags:\n  - "zotero\/health-services-accessibility"\n  - "zotero\/child-preschool"/);
+  assert.match(paperContent, /zotero_tags:\n  - "Health Services Accessibility"\n  - "Child, Preschool"/);
+  assert.doesNotMatch(paperContent, /^tags:\n  - "Health Services Accessibility"/m);
 });
 
 test("syncSnapshotToStore preserves user note sections on repeat sync", async () => {
@@ -82,6 +97,10 @@ test("syncSnapshotToStore preserves user note sections on repeat sync", async ()
   assert.equal(result.updated, 2);
   assert.match(store.files.get(path)!, /title: "Multi Collection Paper Revised"/);
   assert.match(store.files.get(path)!, /My long hand-written note\./);
+
+  const searchIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`)!);
+  const entry = searchIndex.entries.find((candidate: { itemKey?: string }) => candidate.itemKey === "I1");
+  assert.match(entry.content, /My long hand-written note\./);
 });
 
 test("syncSnapshotToStore marks missing Zotero items without deleting notes", async () => {
@@ -165,6 +184,22 @@ test("syncSnapshotToStore creates standalone native note files and marks missing
   assert.match(store.files.get(standalonePath)!, /zotero_note_deleted: true/);
 });
 
+test("syncSnapshotToStore writes native notes and standalone notes into the search index", async () => {
+  const store = new MemoryStore();
+  await syncSnapshotToStore(snapshotFixtureWithNativeNotes(), store, DEFAULT_SYNC_SETTINGS, {
+    now: "2026-06-02T00:00:00.000Z"
+  });
+
+  const searchIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`)!);
+  const paperEntry = searchIndex.entries.find((entry: { itemKey?: string }) => entry.itemKey === "I1");
+  const standaloneEntry = searchIndex.entries.find((entry: { noteKey?: string }) => entry.noteKey === "N2");
+
+  assert.equal(paperEntry.kind, "paper");
+  assert.match(paperEntry.content, /A \*\*strong\*\* Zotero note/);
+  assert.equal(standaloneEntry.kind, "standalone-note");
+  assert.match(standaloneEntry.content, /Standalone Zotero note/);
+});
+
 function snapshotFixture(overrides: { title?: string } = {}): ZoteroBridgeSnapshot {
   return {
     schemaVersion: 1,
@@ -197,7 +232,7 @@ function snapshotFixture(overrides: { title?: string } = {}): ZoteroBridgeSnapsh
         publicationTitle: "Journal of Tests",
         doi: "10.0000/example",
         collectionKeys: ["C1", "C2"],
-        tags: ["planning"],
+        tags: ["Health Services Accessibility", "Child, Preschool"],
         zoteroUri: "zotero://select/library/items/I1",
         attachments: [{ key: "A1", mimeType: "application/pdf", zoteroUri: "zotero://select/library/items/A1" }],
         version: 12

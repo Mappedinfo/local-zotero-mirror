@@ -12,6 +12,7 @@ export const MANAGED_FRONTMATTER_KEYS = [
   "url",
   "collections",
   "tags",
+  "zotero_tags",
   "zotero_uri",
   "pdf_uri",
   "zotero_version",

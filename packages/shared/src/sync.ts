@@ -26,10 +26,12 @@ import type {
   ZoteroCollection,
   ZoteroItem,
   ZoteroNativeNote,
-  ZoteroObsidianIndex
+  ZoteroObsidianIndex,
+  ZoteroObsidianSearchIndex
 } from "./types.ts";
 
 export const OBSIDIAN_ZOTERO_INDEX_FILE_NAME = ".obsidian-zotero-index.json";
+export const OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME = ".obsidian-zotero-search-index.json";
 
 export const DEFAULT_SYNC_SETTINGS: SyncSettings = {
   targetFolder: "Zotero",
@@ -61,6 +63,7 @@ export async function syncSnapshotToStore(
     standaloneNotesUnchanged: 0,
     indexesWritten: 0,
     obsidianIndexWritten: 0,
+    searchIndexWritten: 0,
     deletedMarked: 0,
     standaloneNotesDeletedMarked: 0,
     archived: 0,
@@ -73,6 +76,7 @@ export async function syncSnapshotToStore(
   const collectionLabelsByKey = buildCollectionLabelsByKey(snapshot.collections);
   const notePathsByItemKey = new Map<string, string>();
   const standaloneNotePathsByKey = new Map<string, string>();
+  const noteContentsByPath = new Map<string, string>();
   const usedPaths = new Set(existingRecords.map((record) => uniquePathKey(record.path)));
   const activeItems = snapshot.items.filter((item) => includeItem(item, settings.libraryScope));
   const activeItemKeys = new Set(activeItems.map((item) => item.key));
@@ -104,6 +108,7 @@ export async function syncSnapshotToStore(
       : itemNativeNotes.length > 0
         ? renderNewPaperNoteWithNativeNotes(item, now, collectionLabels, itemNativeNotes)
         : renderNewPaperNote(item, now, collectionLabels);
+    noteContentsByPath.set(path, nextContent);
 
     if (!existing) {
       result.created += 1;
@@ -123,6 +128,7 @@ export async function syncSnapshotToStore(
     activeStandaloneNotes,
     existingByStandaloneNoteKey,
     standaloneNotePathsByKey,
+    noteContentsByPath,
     usedPaths,
     settings,
     store,
@@ -158,6 +164,19 @@ export async function syncSnapshotToStore(
     nativeNotesByParentItemKey,
     activeStandaloneNotes,
     standaloneNotePathsByKey,
+    settings,
+    store,
+    now,
+    dryRun,
+    result
+  });
+
+  await writeSearchIndex({
+    activeItems,
+    notePathsByItemKey,
+    activeStandaloneNotes,
+    standaloneNotePathsByKey,
+    noteContentsByPath,
     settings,
     store,
     now,
@@ -299,6 +318,7 @@ async function writeStandaloneNativeNotes(args: {
   activeStandaloneNotes: ZoteroNativeNote[];
   existingByStandaloneNoteKey: Map<string, NoteRecord>;
   standaloneNotePathsByKey: Map<string, string>;
+  noteContentsByPath: Map<string, string>;
   usedPaths: Set<string>;
   settings: SyncSettings;
   store: NoteStore;
@@ -310,6 +330,7 @@ async function writeStandaloneNativeNotes(args: {
     activeStandaloneNotes,
     existingByStandaloneNoteKey,
     standaloneNotePathsByKey,
+    noteContentsByPath,
     usedPaths,
     settings,
     store,
@@ -332,6 +353,7 @@ async function writeStandaloneNativeNotes(args: {
     const nextContent = existing
       ? mergeExistingStandaloneNativeNote(existing.content, note, now, false)
       : renderNewStandaloneNativeNote(note, now);
+    noteContentsByPath.set(path, nextContent);
 
     if (!existing) {
       result.standaloneNotesCreated += 1;
@@ -450,6 +472,84 @@ async function writeObsidianIndex(args: {
   result.obsidianIndexWritten += 1;
   result.operations.push({ action: "write-obsidian-index", path });
   await writeIfNeeded(store, path, `${JSON.stringify(index, null, 2)}\n`, dryRun);
+}
+
+async function writeSearchIndex(args: {
+  activeItems: ZoteroItem[];
+  notePathsByItemKey: Map<string, string>;
+  activeStandaloneNotes: ZoteroNativeNote[];
+  standaloneNotePathsByKey: Map<string, string>;
+  noteContentsByPath: Map<string, string>;
+  settings: SyncSettings;
+  store: NoteStore;
+  now: string;
+  dryRun: boolean;
+  result: SyncResult;
+}): Promise<void> {
+  const {
+    activeItems,
+    notePathsByItemKey,
+    activeStandaloneNotes,
+    standaloneNotePathsByKey,
+    noteContentsByPath,
+    settings,
+    store,
+    now,
+    dryRun,
+    result
+  } = args;
+  const searchIndex: ZoteroObsidianSearchIndex = {
+    schemaVersion: 1,
+    generatedAt: now,
+    targetFolder: settings.targetFolder,
+    entries: []
+  };
+
+  for (const item of activeItems) {
+    const path = notePathsByItemKey.get(item.key);
+    if (!path) continue;
+    const content = noteContentsByPath.get(path);
+    if (content === undefined) continue;
+    searchIndex.entries.push({
+      kind: "paper",
+      path,
+      title: item.title,
+      citekey: item.citekey,
+      year: item.year,
+      itemKey: item.key,
+      zoteroUri: item.zoteroUri,
+      updatedAt: now,
+      content: normalizeSearchIndexContent(content)
+    });
+  }
+
+  for (const note of activeStandaloneNotes) {
+    const path = standaloneNotePathsByKey.get(note.key);
+    if (!path) continue;
+    const content = noteContentsByPath.get(path);
+    if (content === undefined) continue;
+    searchIndex.entries.push({
+      kind: "standalone-note",
+      path,
+      title: note.title || `Zotero note ${note.key}`,
+      noteKey: note.key,
+      zoteroUri: note.zoteroUri,
+      updatedAt: now,
+      content: normalizeSearchIndexContent(content)
+    });
+  }
+
+  const path = normalizeVaultPath(`${settings.targetFolder}/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`);
+  result.searchIndexWritten += 1;
+  result.operations.push({ action: "write-search-index", path });
+  await writeIfNeeded(store, path, `${JSON.stringify(searchIndex, null, 2)}\n`, dryRun);
+}
+
+function normalizeSearchIndexContent(markdown: string): string {
+  return String(markdown || "")
+    .normalize("NFKC")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
 }
 
 function collectionIndexPath(settings: SyncSettings, collection: ZoteroCollection): string {
