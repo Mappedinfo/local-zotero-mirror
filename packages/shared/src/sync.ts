@@ -6,7 +6,7 @@ import {
   sanitizePathSegment,
   uniquePathKey
 } from "./format.ts";
-import { readFrontmatterString } from "./frontmatter.ts";
+import { readFrontmatterString, readFrontmatterStringArray } from "./frontmatter.ts";
 import {
   mergeExistingPaperNote,
   mergeExistingStandaloneNativeNote,
@@ -570,6 +570,8 @@ function itemFromExistingNote(key: string, content: string): ZoteroItem {
     citekey: readFrontmatterString(content, "citekey"),
     citation: {
       citekey: readFrontmatterString(content, "citekey") || key,
+      aliases: readFrontmatterStringArray(content, "citation_aliases"),
+      citekeySource: readCitekeySource(content),
       apaInText: readFrontmatterString(content, "citation_apa"),
       apaReference: readFrontmatterString(content, "reference_apa"),
       bibtex: readFrontmatterString(content, "bibtex")
@@ -587,6 +589,11 @@ function itemFromExistingNote(key: string, content: string): ZoteroItem {
     attachments: [],
     deleted: true
   };
+}
+
+function readCitekeySource(content: string): "explicit" | "generated" | undefined {
+  const source = readFrontmatterString(content, "citekey_source");
+  return source === "explicit" || source === "generated" ? source : undefined;
 }
 
 function makeStandaloneNativeNoteFileName(note: ZoteroNativeNote): string {

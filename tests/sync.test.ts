@@ -66,6 +66,9 @@ test("syncSnapshotToStore creates canonical paper notes and collection indexes",
 
   const obsidianIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`)!);
   assert.equal(obsidianIndex.items.I1.path, "Zotero/Papers/2024 - Smith - Multi Collection Paper.md");
+  assert.equal(obsidianIndex.items.I1.citekey, "smithMulti2024");
+  assert.deepEqual(obsidianIndex.items.I1.citation.aliases, ["SmithMulti2024", "I1"]);
+  assert.equal(obsidianIndex.items.I1.citation.citekeySource, "explicit");
   assert.equal(obsidianIndex.items.I1.citation.apaInText, "(Smith, 2024)");
 
   const searchIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`)!);
@@ -77,6 +80,9 @@ test("syncSnapshotToStore creates canonical paper notes and collection indexes",
   assert.doesNotMatch(JSON.stringify(searchIndex), /Path: Planning \/ Scenario Assessment/);
 
   const paper = store.files.get("Zotero/Papers/2024 - Smith - Multi Collection Paper.md")!;
+  assert.match(paper, /citekey: "smithMulti2024"/);
+  assert.match(paper, /citation_aliases:\n  - "SmithMulti2024"\n  - "I1"/);
+  assert.match(paper, /citekey_source: "explicit"/);
   assert.match(paper, /citation_apa: "\(Smith, 2024\)"/);
   assert.match(paper, /reference_apa: "Smith, A\. \(2024\)\. Multi Collection Paper\."/);
   assert.match(paper, /bibtex: "@article\{smithMulti2024/);
@@ -230,6 +236,8 @@ function snapshotFixture(overrides: { title?: string } = {}): ZoteroBridgeSnapsh
         citekey: "smithMulti2024",
         citation: {
           citekey: "smithMulti2024",
+          aliases: ["SmithMulti2024", "I1"],
+          citekeySource: "explicit",
           apaInText: "(Smith, 2024)",
           apaReference: "Smith, A. (2024). Multi Collection Paper.",
           bibtex: "@article{smithMulti2024,\n  title = {Multi Collection Paper}\n}"

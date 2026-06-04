@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mergeManagedFrontmatter, readFrontmatterString } from "../packages/shared/src/index.ts";
+import { mergeManagedFrontmatter, readFrontmatterString, readFrontmatterStringArray } from "../packages/shared/src/index.ts";
 
 test("mergeManagedFrontmatter preserves user fields and body", () => {
   const original = [
@@ -30,4 +30,5 @@ test("mergeManagedFrontmatter preserves user fields and body", () => {
   assert.match(merged, /zotero_tags:\n  - "Zotero Source Tag"/);
   assert.match(merged, /## Summary\nMy own note\./);
   assert.equal(readFrontmatterString(merged, "zotero_key"), "NEW");
+  assert.deepEqual(readFrontmatterStringArray(merged, "tags"), ["zotero", "paper"]);
 });

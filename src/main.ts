@@ -234,7 +234,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
   private async fetchCitationResponse(groups: string[][]): Promise<ZoteroCitationResponse> {
     const cacheKey = `${this.settings.libraryScope}:apa:${groups.map(citationGroupKey).join("|")}`;
     const cached = this.citationCache.get(cacheKey);
-    if (cached) return cached;
+    if (cached?.source === "zotero") return cached;
 
     const bridgeUrl = new URL(`${trimSlash(this.settings.bridgeUrl)}/citations`);
 
@@ -270,8 +270,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
           title: item.title,
           citation
         };
-        itemsByKey.set(citation.citekey, entry);
-        itemsByKey.set(item.key, entry);
+        this.registerCitationEntry(itemsByKey, entry, [item.citekey, item.key]);
       }
     }
 
@@ -290,8 +289,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
           path: item.path,
           citation
         };
-        itemsByKey.set(citation.citekey, entry);
-        itemsByKey.set(item.itemKey, entry);
+        this.registerCitationEntry(itemsByKey, entry, [item.citekey, item.itemKey]);
       }
     }
 
@@ -326,6 +324,19 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
               error instanceof Error ? error.message : String(error)
             }`
     };
+  }
+
+  private registerCitationEntry(
+    itemsByKey: Map<string, ZoteroCitationItem>,
+    entry: ZoteroCitationItem,
+    legacyKeys: Array<string | undefined> = []
+  ): void {
+    const keys = [entry.citekey, entry.citation.citekey, ...(entry.citation.aliases ?? []), ...legacyKeys];
+    for (const key of new Set(keys.filter((value): value is string => Boolean(value)))) {
+      if (!itemsByKey.has(key)) {
+        itemsByKey.set(key, entry);
+      }
+    }
   }
 
   private snapshotCitationFallback(item: ZoteroBridgeSnapshot["items"][number]): ZoteroCitationMetadata {

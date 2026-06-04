@@ -20,6 +20,8 @@ export function buildManagedFields(
   const fields: Record<string, YamlValue> = {
     zotero_key: item.key,
     citekey: item.citekey,
+    citation_aliases: item.citation?.aliases,
+    citekey_source: item.citation?.citekeySource,
     citation_apa: item.citation?.apaInText,
     reference_apa: item.citation?.apaReference,
     bibtex: item.citation?.bibtex,

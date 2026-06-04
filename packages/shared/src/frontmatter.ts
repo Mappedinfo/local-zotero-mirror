@@ -3,6 +3,8 @@ export type YamlValue = string | number | boolean | string[] | undefined | null;
 export const MANAGED_FRONTMATTER_KEYS = [
   "zotero_key",
   "citekey",
+  "citation_aliases",
+  "citekey_source",
   "citation_apa",
   "reference_apa",
   "bibtex",
@@ -53,6 +55,34 @@ export function readFrontmatterString(markdown: string, key: string): string | u
     const match = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
     if (!match || match[1] !== key) continue;
     return unquoteYamlString(match[2].trim());
+  }
+  return undefined;
+}
+
+export function readFrontmatterStringArray(markdown: string, key: string): string[] | undefined {
+  const { frontmatter } = splitFrontmatter(markdown);
+  for (let index = 0; index < frontmatter.length; index += 1) {
+    const match = frontmatter[index].match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!match || match[1] !== key) continue;
+
+    const inlineValue = match[2].trim();
+    if (inlineValue.startsWith("[") && inlineValue.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(inlineValue);
+        return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+
+    const values: string[] = [];
+    for (let lineIndex = index + 1; lineIndex < frontmatter.length; lineIndex += 1) {
+      const line = frontmatter[lineIndex];
+      if (/^[A-Za-z0-9_-]+:/.test(line)) break;
+      const itemMatch = line.match(/^\s*-\s*(.*)$/);
+      if (itemMatch) values.push(unquoteYamlString(itemMatch[1].trim()));
+    }
+    return values.length > 0 ? values : undefined;
   }
   return undefined;
 }

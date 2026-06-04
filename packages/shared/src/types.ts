@@ -44,6 +44,8 @@ export interface ZoteroCreator {
 
 export interface ZoteroCitationMetadata {
   citekey: string;
+  aliases?: string[];
+  citekeySource?: "explicit" | "generated";
   apaInText?: string;
   apaReference?: string;
   bibtex?: string;
