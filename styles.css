@@ -21,6 +21,11 @@
   font-weight: 600;
 }
 
+.local-zotero-editor-citation {
+  border-radius: 4px;
+  padding: 0 0.18em;
+}
+
 .local-zotero-references {
   border-top: 1px solid var(--background-modifier-border);
   margin-top: 2rem;
@@ -44,4 +49,69 @@
 
 .local-zotero-references ol {
   padding-left: 1.5rem;
+}
+
+.local-zotero-current-citations {
+  padding: 0.75rem;
+}
+
+.local-zotero-current-citations-heading {
+  font-size: var(--font-ui-medium);
+  margin: 0 0 0.5rem;
+}
+
+.local-zotero-current-citations-file,
+.local-zotero-current-citations-status {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin: 0 0 0.75rem;
+}
+
+.local-zotero-current-citations-status.is-error {
+  color: var(--text-error);
+}
+
+.local-zotero-current-citations-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.local-zotero-current-citation-item {
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 0.75rem;
+}
+
+.local-zotero-current-citation-citekey {
+  color: var(--text-accent);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  margin-bottom: 0.2rem;
+}
+
+.local-zotero-current-citation-title {
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.local-zotero-current-citation-reference {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.35;
+  margin: 0.35rem 0 0;
+}
+
+.local-zotero-current-citation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+
+.local-zotero-current-citation-action {
+  font-size: var(--font-ui-smaller);
+  min-height: 24px;
+  padding: 2px 8px;
 }

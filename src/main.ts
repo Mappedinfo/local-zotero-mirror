@@ -1,19 +1,27 @@
 import {
   App,
+  ItemView,
+  MarkdownView,
   Menu,
   Notice,
   Plugin,
   PluginSettingTab,
   Setting,
   TFile,
+  WorkspaceLeaf,
+  editorInfoField,
+  editorLivePreviewField,
   normalizePath,
   requestUrl
 } from "obsidian";
 import type { MarkdownPostProcessorContext } from "obsidian";
+import { StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
+import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from "@codemirror/view";
 import {
   DEFAULT_SYNC_SETTINGS,
   OBSIDIAN_ZOTERO_INDEX_FILE_NAME,
   assertZoteroSnapshot,
+  buildCitationRenderRanges,
   citationGroupKey,
   dirname,
   findPandocCitationGroups,
@@ -34,6 +42,31 @@ import {
 
 type ZoteroUriField = "zotero_uri" | "pdf_uri";
 
+interface CitationDocumentState {
+  sourcePath: string;
+  markdown: string;
+  groups: string[][];
+  response: ZoteroCitationResponse | null;
+  updatedAt: number;
+}
+
+interface CurrentCitationPanelEntry {
+  citekey: string;
+  title: string;
+  apaReference?: string;
+  notePath?: string;
+  zoteroUri?: string;
+  pdfUri?: string;
+}
+
+interface CurrentCitationsPanelData {
+  file: TFile | null;
+  sourcePath: string;
+  response: ZoteroCitationResponse | null;
+  entries: CurrentCitationPanelEntry[];
+  missingCitekeys: string[];
+}
+
 interface ConnectorSettings extends SyncSettings {
   bridgeUrl: string;
   syncIntervalMinutes: number;
@@ -47,15 +80,35 @@ const DEFAULT_SETTINGS: ConnectorSettings = {
   dryRunPreview: false
 };
 
+const CURRENT_CITATIONS_VIEW_TYPE = "local-zotero-current-citations";
+const CITATION_WIDGET_CLASS = "local-zotero-editor-citation";
+const citationRenderEffect = StateEffect.define<CitationDocumentState | null>();
+const citationDocumentStateField = StateField.define<CitationDocumentState | null>({
+  create: () => null,
+  update: (value, transaction) => {
+    for (const effect of transaction.effects) {
+      if (effect.is(citationRenderEffect)) {
+        return effect.value;
+      }
+    }
+    return value;
+  }
+});
+
 export default class ObsidianZoteroConnectorPlugin extends Plugin {
   settings: ConnectorSettings = DEFAULT_SETTINGS;
   private citationCache = new Map<string, ZoteroCitationResponse>();
   private lastSnapshot: ZoteroBridgeSnapshot | null = null;
   private referenceRenderTimers = new Map<string, number>();
+  private editorViews = new Set<EditorView>();
+  private editorResolveTimers = new Map<string, number>();
+  private currentCitationsRefreshTimer: number | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
     this.addSettingTab(new ConnectorSettingTab(this.app, this));
+    this.registerView(CURRENT_CITATIONS_VIEW_TYPE, (leaf) => new CurrentCitationsView(leaf, this));
+    this.registerEditorExtension(createCitationEditorExtension(this));
 
     this.addCommand({
       id: "sync-zotero-library",
@@ -87,9 +140,32 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       callback: () => this.runSync({ dryRun: false })
     });
 
+    this.addCommand({
+      id: "open-current-citations-panel",
+      name: "Open Current Citations Panel",
+      callback: () => this.openCurrentCitationsPanel()
+    });
+
     this.registerContextMenus();
     this.registerMarkdownPostProcessor((element, context) => this.renderPandocCitations(element, context));
+    this.registerCitationPanelEvents();
     this.registerConfiguredInterval();
+    this.app.workspace.onLayoutReady(() => {
+      void this.openCurrentCitationsPanel({ reveal: false });
+      this.scheduleCurrentCitationsPanelRefresh();
+    });
+  }
+
+  onunload(): void {
+    for (const timer of this.editorResolveTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.editorResolveTimers.clear();
+    if (this.currentCitationsRefreshTimer !== null) {
+      window.clearTimeout(this.currentCitationsRefreshTimer);
+      this.currentCitationsRefreshTimer = null;
+    }
+    this.app.workspace.detachLeavesOfType(CURRENT_CITATIONS_VIEW_TYPE);
   }
 
   async loadSettings(): Promise<void> {
@@ -153,6 +229,164 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       noFileMessage: "No active note.",
       missingLinkMessage: "This note has no Zotero PDF link."
     });
+  }
+
+  registerEditorView(view: EditorView): void {
+    this.editorViews.add(view);
+    this.scheduleEditorCitationResolve(view);
+  }
+
+  unregisterEditorView(view: EditorView): void {
+    this.editorViews.delete(view);
+  }
+
+  scheduleEditorCitationResolve(view: EditorView): void {
+    const sourcePath = sourcePathFromEditorView(view);
+    if (!sourcePath) return;
+    if (!isLivePreview(view)) return;
+    const existing = this.editorResolveTimers.get(sourcePath);
+    if (existing !== undefined) {
+      window.clearTimeout(existing);
+    }
+
+    const markdown = view.state.doc.toString();
+    const timer = window.setTimeout(() => {
+      this.editorResolveTimers.delete(sourcePath);
+      void this.resolveCitationDocumentState(sourcePath, markdown)
+        .then((state) => {
+          this.dispatchCitationStateToEditors(state);
+          if (this.app.workspace.getActiveFile()?.path === sourcePath) {
+            this.scheduleCurrentCitationsPanelRefresh();
+          }
+        })
+        .catch((error) => {
+          console.error("[local-zotero-mirror] Editor citation render failed", error);
+          this.dispatchCitationStateToEditors({
+            sourcePath,
+            markdown,
+            groups: uniqueCitationGroups(findPandocCitationGroups(markdown)),
+            response: null,
+            updatedAt: Date.now()
+          });
+        });
+    }, 250);
+    this.editorResolveTimers.set(sourcePath, timer);
+  }
+
+  async resolveCitationDocumentState(sourcePath: string, markdown: string): Promise<CitationDocumentState> {
+    const groups = uniqueCitationGroups(findPandocCitationGroups(markdown));
+    const response = groups.length > 0 ? await this.fetchCitationResponse(groups) : null;
+    return {
+      sourcePath,
+      markdown,
+      groups,
+      response,
+      updatedAt: Date.now()
+    };
+  }
+
+  async openCurrentCitationsPanel(options: { reveal?: boolean } = { reveal: true }): Promise<void> {
+    let leaf = this.app.workspace.getLeavesOfType(CURRENT_CITATIONS_VIEW_TYPE)[0];
+    if (!leaf) {
+      leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
+      await leaf.setViewState({ type: CURRENT_CITATIONS_VIEW_TYPE, active: true });
+    }
+    if (options.reveal !== false) {
+      await this.app.workspace.revealLeaf(leaf);
+    }
+    this.scheduleCurrentCitationsPanelRefresh();
+  }
+
+  scheduleCurrentCitationsPanelRefresh(): void {
+    if (this.currentCitationsRefreshTimer !== null) {
+      window.clearTimeout(this.currentCitationsRefreshTimer);
+    }
+    this.currentCitationsRefreshTimer = window.setTimeout(() => {
+      this.currentCitationsRefreshTimer = null;
+      void this.refreshCurrentCitationsPanels();
+    }, 150);
+  }
+
+  async getCurrentCitationsPanelData(): Promise<CurrentCitationsPanelData> {
+    const file = this.app.workspace.getActiveFile();
+    if (!(file instanceof TFile) || file.extension !== "md") {
+      return { file: null, sourcePath: "", response: null, entries: [], missingCitekeys: [] };
+    }
+
+    const markdown = this.getActiveMarkdownText(file) ?? (await this.app.vault.cachedRead(file));
+    const state = await this.resolveCitationDocumentState(file.path, markdown);
+    const response = state.response;
+    if (!response) {
+      return { file, sourcePath: file.path, response: null, entries: [], missingCitekeys: [] };
+    }
+
+    const index = await this.readObsidianIndex().catch(() => null);
+    const entries = response.entries.map((entry) => this.enrichCitationPanelEntry(entry, index));
+    return {
+      file,
+      sourcePath: file.path,
+      response,
+      entries,
+      missingCitekeys: response.missingCitekeys
+    };
+  }
+
+  private registerCitationPanelEvents(): void {
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => {
+        this.scheduleCurrentCitationsPanelRefresh();
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("editor-change", (_editor, info) => {
+        const file = info.file;
+        if (file instanceof TFile && file.path === this.app.workspace.getActiveFile()?.path) {
+          this.scheduleCurrentCitationsPanelRefresh();
+        }
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (file instanceof TFile && file.path === this.app.workspace.getActiveFile()?.path) {
+          this.scheduleCurrentCitationsPanelRefresh();
+        }
+      })
+    );
+  }
+
+  private async refreshCurrentCitationsPanels(): Promise<void> {
+    const leaves = this.app.workspace.getLeavesOfType(CURRENT_CITATIONS_VIEW_TYPE);
+    await Promise.all(
+      leaves.map(async (leaf) => {
+        if (leaf.view instanceof CurrentCitationsView) {
+          await leaf.view.refresh();
+        }
+      })
+    );
+  }
+
+  private dispatchCitationStateToEditors(state: CitationDocumentState): void {
+    for (const view of this.editorViews) {
+      if (sourcePathFromEditorView(view) !== state.sourcePath) continue;
+      view.dispatch({ effects: citationRenderEffect.of(state) });
+    }
+  }
+
+  private enrichCitationPanelEntry(
+    entry: ZoteroCitationItem,
+    index: ZoteroObsidianIndex | null
+  ): CurrentCitationPanelEntry {
+    const indexItem = index?.items[entry.itemKey];
+    const notePath = entry.path || indexItem?.path;
+    const noteFile = notePath ? this.getMarkdownFile(notePath) : null;
+    return {
+      citekey: entry.citekey,
+      title: entry.title,
+      apaReference: entry.citation.apaReference,
+      notePath,
+      zoteroUri: indexItem?.zoteroUri || (noteFile ? this.getFrontmatterUri(noteFile, "zotero_uri") || undefined : undefined),
+      pdfUri: noteFile ? this.getFrontmatterUri(noteFile, "pdf_uri") || undefined : undefined
+    };
   }
 
   private async renderPandocCitations(element: HTMLElement, context: MarkdownPostProcessorContext): Promise<void> {
@@ -231,7 +465,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     return span;
   }
 
-  private async fetchCitationResponse(groups: string[][]): Promise<ZoteroCitationResponse> {
+  async fetchCitationResponse(groups: string[][]): Promise<ZoteroCitationResponse> {
     const cacheKey = `${this.settings.libraryScope}:apa:${groups.map(citationGroupKey).join("|")}`;
     const cached = this.citationCache.get(cacheKey);
     if (cached?.source === "zotero") return cached;
@@ -507,6 +741,16 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     return typeof uri === "string" && uri.length > 0 ? uri : null;
   }
 
+  private getMarkdownFile(path: string): TFile | null {
+    const file = this.app.vault.getAbstractFileByPath(normalizePath(path));
+    return file instanceof TFile && file.extension === "md" ? file : null;
+  }
+
+  private getActiveMarkdownText(file: TFile): string | null {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    return view?.file?.path === file.path ? view.getViewData() : null;
+  }
+
   private openZoteroUriFromFile(
     file: TFile | null,
     field: ZoteroUriField,
@@ -533,6 +777,278 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
         void this.runSync({ dryRun: this.settings.dryRunPreview, silent: true });
       }, minutes * 60 * 1000)
     );
+  }
+}
+
+function createCitationEditorExtension(plugin: ObsidianZoteroConnectorPlugin): Extension {
+  const citationViewPlugin = ViewPlugin.fromClass(
+    class {
+      decorations: DecorationSet;
+
+      constructor(private readonly view: EditorView) {
+        plugin.registerEditorView(view);
+        plugin.scheduleEditorCitationResolve(view);
+        this.decorations = buildEditorCitationDecorations(view);
+      }
+
+      update(update: ViewUpdate): void {
+        const sourceChanged = sourcePathFromState(update.startState) !== sourcePathFromState(update.state);
+        if (update.docChanged || sourceChanged || livePreviewChanged(update)) {
+          plugin.scheduleEditorCitationResolve(update.view);
+        }
+
+        if (
+          update.docChanged ||
+          update.selectionSet ||
+          update.viewportChanged ||
+          livePreviewChanged(update) ||
+          update.transactions.some((transaction) =>
+            transaction.effects.some((effect) => effect.is(citationRenderEffect))
+          )
+        ) {
+          this.decorations = buildEditorCitationDecorations(update.view);
+        }
+      }
+
+      destroy(): void {
+        plugin.unregisterEditorView(this.view);
+      }
+    },
+    {
+      decorations: (value) => value.decorations
+    }
+  );
+
+  return [citationDocumentStateField, citationViewPlugin];
+}
+
+function buildEditorCitationDecorations(view: EditorView): DecorationSet {
+  if (!isLivePreview(view)) return Decoration.none;
+  const sourcePath = sourcePathFromEditorView(view);
+  const citationState = view.state.field(citationDocumentStateField, false);
+  if (!sourcePath || citationState?.sourcePath !== sourcePath) return Decoration.none;
+
+  const ranges = buildCitationRenderRanges(
+    view.state.doc.toString(),
+    citationState.response,
+    view.state.selection.ranges.map((range) => ({ from: range.from, to: range.to }))
+  );
+  return Decoration.set(
+    ranges.map((range) =>
+      Decoration.replace({
+        widget: new CitationWidget(range.rendered, {
+          citekeys: range.citekeys,
+          missing: range.missing,
+          source: range.source
+        }),
+        inclusive: false
+      }).range(range.from, range.to)
+    ),
+    true
+  );
+}
+
+class CitationWidget extends WidgetType {
+  constructor(
+    private readonly rendered: string,
+    private readonly metadata: {
+      citekeys: string[];
+      missing: string[];
+      source: ZoteroCitationResponse["source"] | "none";
+    }
+  ) {
+    super();
+  }
+
+  eq(other: CitationWidget): boolean {
+    return (
+      this.rendered === other.rendered &&
+      this.metadata.source === other.metadata.source &&
+      this.metadata.citekeys.join(",") === other.metadata.citekeys.join(",") &&
+      this.metadata.missing.join(",") === other.metadata.missing.join(",")
+    );
+  }
+
+  toDOM(): HTMLElement {
+    const span = document.createElement("span");
+    span.className = `${CITATION_WIDGET_CLASS} local-zotero-citation`;
+    if (this.metadata.missing.length > 0) {
+      span.classList.add("is-missing");
+    } else if (this.metadata.source !== "zotero") {
+      span.classList.add("is-cached");
+    }
+    span.textContent = this.rendered;
+    span.title = [
+      `Zotero citation: ${this.metadata.citekeys.join(", ")}`,
+      this.metadata.missing.length > 0 ? `Missing citekey: ${this.metadata.missing.join(", ")}` : "",
+      this.metadata.source !== "zotero" && this.metadata.source !== "none"
+        ? `Citation source: ${this.metadata.source}`
+        : ""
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return span;
+  }
+
+  ignoreEvent(): boolean {
+    return false;
+  }
+}
+
+class CurrentCitationsView extends ItemView {
+  constructor(leaf: WorkspaceLeaf, private readonly plugin: ObsidianZoteroConnectorPlugin) {
+    super(leaf);
+  }
+
+  getViewType(): string {
+    return CURRENT_CITATIONS_VIEW_TYPE;
+  }
+
+  getDisplayText(): string {
+    return "当前引用的文献";
+  }
+
+  getIcon(): string {
+    return "quote";
+  }
+
+  async onOpen(): Promise<void> {
+    await this.refresh();
+  }
+
+  async refresh(): Promise<void> {
+    const container = this.contentEl;
+    container.empty();
+    container.addClass("local-zotero-current-citations");
+
+    const heading = container.createEl("h3", { text: "当前引用的文献" });
+    heading.addClass("local-zotero-current-citations-heading");
+
+    let data: CurrentCitationsPanelData;
+    try {
+      data = await this.plugin.getCurrentCitationsPanelData();
+    } catch (error) {
+      container.createEl("p", {
+        cls: "local-zotero-current-citations-status is-error",
+        text: `引用读取失败：${error instanceof Error ? error.message : String(error)}`
+      });
+      return;
+    }
+
+    if (!data.file) {
+      container.createEl("p", {
+        cls: "local-zotero-current-citations-status",
+        text: "当前没有打开 Markdown 文件。"
+      });
+      return;
+    }
+
+    container.createEl("div", {
+      cls: "local-zotero-current-citations-file",
+      text: data.file.basename
+    });
+
+    if (!data.response || data.entries.length === 0) {
+      const message = data.missingCitekeys.length > 0
+        ? `缺失 citekey：${data.missingCitekeys.join(", ")}`
+        : "当前文件没有引用文献。";
+      container.createEl("p", {
+        cls: data.missingCitekeys.length > 0
+          ? "local-zotero-current-citations-status is-error"
+          : "local-zotero-current-citations-status",
+        text: message
+      });
+      return;
+    }
+
+    if (data.response.source && data.response.source !== "zotero") {
+      container.createEl("p", {
+        cls: "local-zotero-current-citations-status",
+        text: `Citation source: ${data.response.source}`
+      });
+    }
+
+    if (data.missingCitekeys.length > 0) {
+      container.createEl("p", {
+        cls: "local-zotero-current-citations-status is-error",
+        text: `缺失 citekey：${data.missingCitekeys.join(", ")}`
+      });
+    }
+
+    const list = container.createEl("div", { cls: "local-zotero-current-citations-list" });
+    for (const entry of data.entries) {
+      this.renderEntry(list, entry, data.sourcePath);
+    }
+  }
+
+  private renderEntry(container: HTMLElement, entry: CurrentCitationPanelEntry, sourcePath: string): void {
+    const item = container.createEl("article", { cls: "local-zotero-current-citation-item" });
+    item.createEl("div", { cls: "local-zotero-current-citation-citekey", text: entry.citekey });
+    item.createEl("div", { cls: "local-zotero-current-citation-title", text: entry.title });
+    if (entry.apaReference) {
+      item.createEl("p", { cls: "local-zotero-current-citation-reference", text: entry.apaReference });
+    }
+
+    const actions = item.createEl("div", { cls: "local-zotero-current-citation-actions" });
+    this.addActionButton(actions, "Open note", Boolean(entry.notePath), () => {
+      if (entry.notePath) {
+        const file = this.app.vault.getAbstractFileByPath(normalizePath(entry.notePath));
+        if (file instanceof TFile) {
+          void this.app.workspace.getLeaf(false).openFile(file);
+        } else {
+          void this.app.workspace.openLinkText(entry.notePath, sourcePath, false);
+        }
+      }
+    });
+    this.addActionButton(actions, "Zotero", Boolean(entry.zoteroUri), () => {
+      if (entry.zoteroUri) window.open(entry.zoteroUri);
+    });
+    this.addActionButton(actions, "PDF", Boolean(entry.pdfUri), () => {
+      if (entry.pdfUri) window.open(entry.pdfUri);
+    });
+  }
+
+  private addActionButton(
+    container: HTMLElement,
+    label: string,
+    enabled: boolean,
+    onClick: () => void
+  ): void {
+    const button = container.createEl("button", {
+      cls: "local-zotero-current-citation-action",
+      text: label
+    });
+    button.type = "button";
+    button.disabled = !enabled;
+    button.addEventListener("click", onClick);
+  }
+}
+
+function sourcePathFromEditorView(view: EditorView): string | null {
+  return sourcePathFromState(view.state);
+}
+
+function sourcePathFromState(state: EditorState): string | null {
+  try {
+    return state.field(editorInfoField, false)?.file?.path ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function isLivePreview(view: EditorView): boolean {
+  try {
+    return Boolean(view.state.field(editorLivePreviewField, false));
+  } catch {
+    return false;
+  }
+}
+
+function livePreviewChanged(update: ViewUpdate): boolean {
+  try {
+    return update.startState.field(editorLivePreviewField, false) !== update.state.field(editorLivePreviewField, false);
+  } catch {
+    return false;
   }
 }
 
