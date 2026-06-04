@@ -13,6 +13,12 @@ It is designed to work with the companion Zotero plugin, [Local Zotero Bridge](h
 - Writes a local full-text search index for Zotero-side Obsidian note search.
 - Converts Zotero source tags into Obsidian-safe `zotero/...` tags while preserving originals in `zotero_tags`.
 - Supports opening Zotero items and PDF attachments from Obsidian commands and context menus.
+- Renders Pandoc-style citations such as `[@smith2024]` as APA parenthetical citations in reading mode.
+- Shows a virtual `References` block in reading mode based on citekeys used in the current note.
+
+## Installation and Updates
+
+For BRAT, add this repository URL inside Obsidian: `https://github.com/Mappedinfo/local-zotero-mirror`. BRAT installs and updates from GitHub Releases.
 
 ## Development
 

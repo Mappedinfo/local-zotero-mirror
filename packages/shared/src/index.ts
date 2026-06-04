@@ -1,3 +1,4 @@
+export * from "./citations.ts";
 export * from "./format.ts";
 export * from "./frontmatter.ts";
 export * from "./schema.ts";

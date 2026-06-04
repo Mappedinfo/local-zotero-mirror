@@ -4,7 +4,7 @@ export function assertZoteroSnapshot(value: unknown): asserts value is ZoteroBri
   if (!isRecord(value)) {
     throw new Error("Zotero bridge returned a non-object snapshot.");
   }
-  if (value.schemaVersion !== 1 && value.schemaVersion !== 2) {
+  if (value.schemaVersion !== 1 && value.schemaVersion !== 2 && value.schemaVersion !== 3) {
     throw new Error(`Unsupported Zotero snapshot schema version: ${String(value.schemaVersion)}`);
   }
   if (!Array.isArray(value.collections) || !Array.isArray(value.items)) {

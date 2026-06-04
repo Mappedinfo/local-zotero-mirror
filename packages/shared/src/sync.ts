@@ -449,6 +449,7 @@ async function writeObsidianIndex(args: {
       path,
       title: item.title,
       citekey: item.citekey,
+      citation: item.citation,
       zoteroUri: item.zoteroUri,
       nativeNoteCount: nativeNotesByParentItemKey.get(item.key)?.length ?? 0,
       lastSynced: now
@@ -567,6 +568,12 @@ function itemFromExistingNote(key: string, content: string): ZoteroItem {
     library: { id: "unknown", type: "user" },
     title: readFrontmatterString(content, "title") || "Deleted Zotero item",
     citekey: readFrontmatterString(content, "citekey"),
+    citation: {
+      citekey: readFrontmatterString(content, "citekey") || key,
+      apaInText: readFrontmatterString(content, "citation_apa"),
+      apaReference: readFrontmatterString(content, "reference_apa"),
+      bibtex: readFrontmatterString(content, "bibtex")
+    },
     creators: [],
     year: readFrontmatterString(content, "year"),
     itemType: readFrontmatterString(content, "item_type") || "unknown",

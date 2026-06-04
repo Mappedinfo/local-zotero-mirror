@@ -3,6 +3,9 @@ export type YamlValue = string | number | boolean | string[] | undefined | null;
 export const MANAGED_FRONTMATTER_KEYS = [
   "zotero_key",
   "citekey",
+  "citation_apa",
+  "reference_apa",
+  "bibtex",
   "title",
   "authors",
   "year",

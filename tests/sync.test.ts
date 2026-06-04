@@ -66,6 +66,7 @@ test("syncSnapshotToStore creates canonical paper notes and collection indexes",
 
   const obsidianIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`)!);
   assert.equal(obsidianIndex.items.I1.path, "Zotero/Papers/2024 - Smith - Multi Collection Paper.md");
+  assert.equal(obsidianIndex.items.I1.citation.apaInText, "(Smith, 2024)");
 
   const searchIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`)!);
   assert.equal(searchIndex.schemaVersion, 1);
@@ -75,10 +76,13 @@ test("syncSnapshotToStore creates canonical paper notes and collection indexes",
   assert.match(searchIndex.entries[0].content, /Multi Collection Paper/);
   assert.doesNotMatch(JSON.stringify(searchIndex), /Path: Planning \/ Scenario Assessment/);
 
-  const paperContent = store.files.get("Zotero/Papers/2024 - Smith - Multi Collection Paper.md")!;
-  assert.match(paperContent, /tags:\n  - "zotero\/health-services-accessibility"\n  - "zotero\/child-preschool"/);
-  assert.match(paperContent, /zotero_tags:\n  - "Health Services Accessibility"\n  - "Child, Preschool"/);
-  assert.doesNotMatch(paperContent, /^tags:\n  - "Health Services Accessibility"/m);
+  const paper = store.files.get("Zotero/Papers/2024 - Smith - Multi Collection Paper.md")!;
+  assert.match(paper, /citation_apa: "\(Smith, 2024\)"/);
+  assert.match(paper, /reference_apa: "Smith, A\. \(2024\)\. Multi Collection Paper\."/);
+  assert.match(paper, /bibtex: "@article\{smithMulti2024/);
+  assert.match(paper, /tags:\n  - "zotero\/health-services-accessibility"\n  - "zotero\/child-preschool"/);
+  assert.match(paper, /zotero_tags:\n  - "Health Services Accessibility"\n  - "Child, Preschool"/);
+  assert.doesNotMatch(paper, /^tags:\n  - "Health Services Accessibility"/m);
 });
 
 test("syncSnapshotToStore preserves user note sections on repeat sync", async () => {
@@ -97,7 +101,6 @@ test("syncSnapshotToStore preserves user note sections on repeat sync", async ()
   assert.equal(result.updated, 2);
   assert.match(store.files.get(path)!, /title: "Multi Collection Paper Revised"/);
   assert.match(store.files.get(path)!, /My long hand-written note\./);
-
   const searchIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`)!);
   const entry = searchIndex.entries.find((candidate: { itemKey?: string }) => candidate.itemKey === "I1");
   assert.match(entry.content, /My long hand-written note\./);
@@ -225,6 +228,12 @@ function snapshotFixture(overrides: { title?: string } = {}): ZoteroBridgeSnapsh
         key: "I1",
         library: { id: 1, type: "user" },
         citekey: "smithMulti2024",
+        citation: {
+          citekey: "smithMulti2024",
+          apaInText: "(Smith, 2024)",
+          apaReference: "Smith, A. (2024). Multi Collection Paper.",
+          bibtex: "@article{smithMulti2024,\n  title = {Multi Collection Paper}\n}"
+        },
         title: overrides.title || "Multi Collection Paper",
         creators: [{ firstName: "Ada", lastName: "Smith", creatorType: "author" }],
         year: "2024",

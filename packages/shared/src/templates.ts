@@ -20,6 +20,9 @@ export function buildManagedFields(
   const fields: Record<string, YamlValue> = {
     zotero_key: item.key,
     citekey: item.citekey,
+    citation_apa: item.citation?.apaInText,
+    reference_apa: item.citation?.apaReference,
+    bibtex: item.citation?.bibtex,
     title: item.title,
     authors: item.creators.map(creatorDisplayName).filter(Boolean),
     year: item.year,
@@ -52,6 +55,7 @@ export function renderMetadataBlock(item: ZoteroItem, collectionLabels: string[]
     `> Title: ${item.title || "Untitled"}`,
     `> Key: ${item.key}`,
     item.citekey ? `> Citekey: ${item.citekey}` : undefined,
+    item.citation?.apaInText ? `> Citation: ${item.citation.apaInText}` : undefined,
     item.year ? `> Year: ${item.year}` : undefined,
     item.publicationTitle ? `> Publication: ${item.publicationTitle}` : undefined,
     item.doi ? `> DOI: ${item.doi}` : undefined,

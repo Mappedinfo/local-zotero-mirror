@@ -42,10 +42,18 @@ export interface ZoteroCreator {
   creatorType?: string;
 }
 
+export interface ZoteroCitationMetadata {
+  citekey: string;
+  apaInText?: string;
+  apaReference?: string;
+  bibtex?: string;
+}
+
 export interface ZoteroItem {
   key: string;
   library: ZoteroSnapshotLibrary;
   citekey?: string;
+  citation?: ZoteroCitationMetadata;
   title: string;
   creators: ZoteroCreator[];
   year?: string;
@@ -156,6 +164,7 @@ export interface ZoteroObsidianIndexItem {
   path: string;
   title: string;
   citekey?: string;
+  citation?: ZoteroCitationMetadata;
   zoteroUri?: string;
   nativeNoteCount: number;
   lastSynced: string;
@@ -199,4 +208,32 @@ export interface ZoteroObsidianSearchIndex {
   generatedAt: string;
   targetFolder: string;
   entries: ZoteroObsidianSearchIndexEntry[];
+}
+
+export interface ZoteroCitationItem {
+  itemKey: string;
+  citekey: string;
+  title: string;
+  path?: string;
+  citation: ZoteroCitationMetadata;
+}
+
+export interface ZoteroCitationGroupResult {
+  citekeys: string[];
+  rendered: string;
+  missing: string[];
+  items: ZoteroCitationItem[];
+}
+
+export interface ZoteroCitationResponse {
+  ok: boolean;
+  schemaVersion: number;
+  style: string;
+  generatedAt: string;
+  groups: ZoteroCitationGroupResult[];
+  bibliography: string[];
+  entries: ZoteroCitationItem[];
+  missingCitekeys: string[];
+  source?: "zotero" | "snapshot-cache" | "obsidian-index" | "missing";
+  error?: string;
 }

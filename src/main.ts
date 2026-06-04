@@ -9,18 +9,27 @@ import {
   normalizePath,
   requestUrl
 } from "obsidian";
+import type { MarkdownPostProcessorContext } from "obsidian";
 import {
   DEFAULT_SYNC_SETTINGS,
+  OBSIDIAN_ZOTERO_INDEX_FILE_NAME,
   assertZoteroSnapshot,
+  citationGroupKey,
   dirname,
+  findPandocCitationGroups,
   syncSnapshotToStore,
+  uniqueCitationGroups,
   type DeleteBehavior,
   type LibraryScope,
   type NoteRecord,
   type NoteStore,
   type SyncSettings,
   type ZoteroBridgeSnapshot,
-  type ZoteroBridgeStatus
+  type ZoteroBridgeStatus,
+  type ZoteroCitationItem,
+  type ZoteroCitationMetadata,
+  type ZoteroCitationResponse,
+  type ZoteroObsidianIndex
 } from "../packages/shared/src/index.ts";
 
 type ZoteroUriField = "zotero_uri" | "pdf_uri";
@@ -40,6 +49,9 @@ const DEFAULT_SETTINGS: ConnectorSettings = {
 
 export default class ObsidianZoteroConnectorPlugin extends Plugin {
   settings: ConnectorSettings = DEFAULT_SETTINGS;
+  private citationCache = new Map<string, ZoteroCitationResponse>();
+  private lastSnapshot: ZoteroBridgeSnapshot | null = null;
+  private referenceRenderTimers = new Map<string, number>();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -76,6 +88,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     });
 
     this.registerContextMenus();
+    this.registerMarkdownPostProcessor((element, context) => this.renderPandocCitations(element, context));
     this.registerConfiguredInterval();
   }
 
@@ -100,6 +113,8 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
 
     const snapshot = await fetchBridgeJson<unknown>(bridgeUrl.toString());
     assertZoteroSnapshot(snapshot);
+    this.lastSnapshot = snapshot;
+    this.citationCache.clear();
     return snapshot;
   }
 
@@ -138,6 +153,280 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       noFileMessage: "No active note.",
       missingLinkMessage: "This note has no Zotero PDF link."
     });
+  }
+
+  private async renderPandocCitations(element: HTMLElement, context: MarkdownPostProcessorContext): Promise<void> {
+    const textNodes = this.collectCitationTextNodes(element);
+    const nodeGroups = textNodes
+      .map((node) => ({ node, groups: findPandocCitationGroups(node.nodeValue || "") }))
+      .filter((entry) => entry.groups.length > 0);
+
+    if (nodeGroups.length === 0) return;
+
+    const groups = uniqueCitationGroups(nodeGroups.flatMap((entry) => entry.groups));
+    const response = await this.fetchCitationResponse(groups);
+    for (const { node, groups: matches } of nodeGroups) {
+      this.replaceCitationTextNode(node, matches, response);
+    }
+    this.scheduleReferenceRender(context.sourcePath);
+  }
+
+  private collectCitationTextNodes(element: HTMLElement): Text[] {
+    const nodes: Text[] = [];
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) => {
+        if (!node.nodeValue?.includes("[@")) return NodeFilter.FILTER_REJECT;
+        const parent = node.parentElement;
+        if (!parent || parent.closest("code, pre, a, script, style, .local-zotero-references")) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    let node = walker.nextNode();
+    while (node) {
+      nodes.push(node as Text);
+      node = walker.nextNode();
+    }
+    return nodes;
+  }
+
+  private replaceCitationTextNode(
+    node: Text,
+    groups: ReturnType<typeof findPandocCitationGroups>,
+    response: ZoteroCitationResponse
+  ): void {
+    const text = node.nodeValue || "";
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+
+    for (const group of groups) {
+      fragment.append(document.createTextNode(text.slice(cursor, group.start)));
+      fragment.append(this.createCitationSpan(group.citekeys, response));
+      cursor = group.end;
+    }
+    fragment.append(document.createTextNode(text.slice(cursor)));
+    node.replaceWith(fragment);
+  }
+
+  private createCitationSpan(citekeys: string[], response: ZoteroCitationResponse): HTMLElement {
+    const group = new Map(response.groups.map((entry) => [citationGroupKey(entry.citekeys), entry])).get(
+      citationGroupKey(citekeys)
+    );
+    const missing = group?.missing ?? citekeys;
+    const span = document.createElement("span");
+    span.className = "local-zotero-citation";
+    if (missing.length > 0 || response.source !== "zotero") {
+      span.classList.add(missing.length > 0 ? "is-missing" : "is-cached");
+    }
+    span.textContent = group?.rendered || `[missing: ${citekeys.join(", ")}]`;
+    span.title = [
+      `Zotero citation: ${citekeys.join(", ")}`,
+      missing.length > 0 ? `Missing citekey: ${missing.join(", ")}` : "",
+      response.error ? `Citation source warning: ${response.error}` : ""
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return span;
+  }
+
+  private async fetchCitationResponse(groups: string[][]): Promise<ZoteroCitationResponse> {
+    const cacheKey = `${this.settings.libraryScope}:apa:${groups.map(citationGroupKey).join("|")}`;
+    const cached = this.citationCache.get(cacheKey);
+    if (cached) return cached;
+
+    const bridgeUrl = new URL(`${trimSlash(this.settings.bridgeUrl)}/citations`);
+
+    try {
+      const response = await postBridgeJson<ZoteroCitationResponse>(bridgeUrl.toString(), {
+        style: "apa",
+        scope: this.settings.libraryScope,
+        groups: groups.map((group) => group.join(",")).join("|")
+      });
+      if (response.groups.length !== groups.length) {
+        throw new Error("Zotero bridge returned no citation groups for the requested citekeys.");
+      }
+      this.citationCache.set(cacheKey, response);
+      return response;
+    } catch (error) {
+      const fallback = await this.buildCitationResponseFromCache(groups, error);
+      this.citationCache.set(cacheKey, fallback);
+      return fallback;
+    }
+  }
+
+  private async buildCitationResponseFromCache(groups: string[][], error?: unknown): Promise<ZoteroCitationResponse> {
+    const itemsByKey = new Map<string, ZoteroCitationItem>();
+    let source: ZoteroCitationResponse["source"] = "missing";
+
+    if (this.lastSnapshot) {
+      source = "snapshot-cache";
+      for (const item of this.lastSnapshot.items) {
+        const citation = item.citation || this.snapshotCitationFallback(item);
+        const entry: ZoteroCitationItem = {
+          itemKey: item.key,
+          citekey: citation.citekey,
+          title: item.title,
+          citation
+        };
+        itemsByKey.set(citation.citekey, entry);
+        itemsByKey.set(item.key, entry);
+      }
+    }
+
+    const index = await this.readObsidianIndex().catch(() => null);
+    if (index) {
+      source = source === "missing" ? "obsidian-index" : source;
+      for (const item of Object.values(index.items)) {
+        if (!item.citation && !item.citekey) continue;
+        const citation = item.citation || {
+          citekey: item.citekey || item.itemKey
+        };
+        const entry: ZoteroCitationItem = {
+          itemKey: item.itemKey,
+          citekey: citation.citekey,
+          title: item.title,
+          path: item.path,
+          citation
+        };
+        itemsByKey.set(citation.citekey, entry);
+        itemsByKey.set(item.itemKey, entry);
+      }
+    }
+
+    const requested = [...new Set(groups.flat())];
+    const entries = requested.map((citekey) => itemsByKey.get(citekey)).filter((item): item is ZoteroCitationItem => Boolean(item));
+    const missingCitekeys = requested.filter((citekey) => !itemsByKey.has(citekey));
+    const groupResults = groups.map((citekeys) => {
+      const items = citekeys.map((citekey) => itemsByKey.get(citekey)).filter((item): item is ZoteroCitationItem => Boolean(item));
+      const missing = citekeys.filter((citekey) => !itemsByKey.has(citekey));
+      return {
+        citekeys,
+        rendered: this.combineCachedInText(items, missing, citekeys),
+        missing,
+        items
+      };
+    });
+
+    return {
+      ok: missingCitekeys.length === 0 && entries.length > 0,
+      schemaVersion: 1,
+      style: "apa",
+      generatedAt: new Date().toISOString(),
+      groups: groupResults,
+      bibliography: entries.map((entry) => entry.citation.apaReference).filter((value): value is string => Boolean(value)),
+      entries,
+      missingCitekeys,
+      source,
+      error:
+        error === undefined
+          ? undefined
+          : `Zotero bridge unavailable; rendered from ${source}. ${
+              error instanceof Error ? error.message : String(error)
+            }`
+    };
+  }
+
+  private snapshotCitationFallback(item: ZoteroBridgeSnapshot["items"][number]): ZoteroCitationMetadata {
+    const citekey = item.citekey || item.key;
+    const author = item.creators.find((creator) => creator.creatorType === "author") ?? item.creators[0];
+    const authorLabel = author?.lastName || author?.name || [author?.firstName, author?.lastName].filter(Boolean).join(" ") || item.title;
+    const year = item.year || "n.d.";
+    return {
+      citekey,
+      apaInText: `(${authorLabel}, ${year})`,
+      apaReference: `${authorLabel} (${year}). ${item.title}.`,
+      bibtex: undefined
+    };
+  }
+
+  private combineCachedInText(items: ZoteroCitationItem[], missing: string[], citekeys: string[]): string {
+    if (items.length === 0) return `[missing: ${citekeys.join(", ")}]`;
+    const rendered = items
+      .map((item) => stripOuterParens(item.citation.apaInText || `missing: ${item.citekey}`))
+      .filter(Boolean)
+      .join("; ");
+    const suffix = missing.length > 0 ? ` [missing: ${missing.join(", ")}]` : "";
+    return `(${rendered})${suffix}`;
+  }
+
+  private scheduleReferenceRender(sourcePath: string): void {
+    const existing = this.referenceRenderTimers.get(sourcePath);
+    if (existing !== undefined) {
+      window.clearTimeout(existing);
+    }
+    const timer = window.setTimeout(() => {
+      this.referenceRenderTimers.delete(sourcePath);
+      void this.renderReferencesForFile(sourcePath);
+    }, 100);
+    this.referenceRenderTimers.set(sourcePath, timer);
+  }
+
+  private async renderReferencesForFile(sourcePath: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(sourcePath);
+    if (!(file instanceof TFile)) return;
+
+    const markdown = await this.app.vault.read(file);
+    const groups = uniqueCitationGroups(findPandocCitationGroups(markdown));
+    const response = groups.length > 0 ? await this.fetchCitationResponse(groups) : null;
+
+    for (const target of this.findPreviewTargets(sourcePath)) {
+      target.querySelectorAll(":scope > .local-zotero-references").forEach((element) => element.remove());
+      if (!response || response.entries.length === 0) continue;
+      target.append(this.createReferencesBlock(response));
+    }
+  }
+
+  private findPreviewTargets(sourcePath: string): HTMLElement[] {
+    const targets: HTMLElement[] = [];
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = leaf.view as unknown as { file?: TFile; containerEl?: HTMLElement };
+      if (view.file?.path !== sourcePath || !view.containerEl) return;
+      const preview = view.containerEl.querySelector<HTMLElement>(".markdown-preview-view");
+      const target = preview?.querySelector<HTMLElement>(".markdown-preview-sizer") || preview;
+      if (target) targets.push(target);
+    });
+    return targets;
+  }
+
+  private createReferencesBlock(response: ZoteroCitationResponse): HTMLElement {
+    const block = document.createElement("section");
+    block.className = "local-zotero-references";
+
+    const heading = document.createElement("h2");
+    heading.textContent = "References";
+    block.append(heading);
+
+    if (response.error || response.source !== "zotero") {
+      const status = document.createElement("p");
+      status.className = "local-zotero-references-status";
+      status.textContent = response.error || `Citation source: ${response.source}`;
+      block.append(status);
+    }
+
+    if (response.missingCitekeys.length > 0) {
+      const missing = document.createElement("p");
+      missing.className = "local-zotero-references-missing";
+      missing.textContent = `Missing Zotero citekeys: ${response.missingCitekeys.join(", ")}`;
+      block.append(missing);
+    }
+
+    const list = document.createElement("ol");
+    for (const entry of response.bibliography) {
+      const item = document.createElement("li");
+      item.textContent = entry;
+      list.append(item);
+    }
+    block.append(list);
+    return block;
+  }
+
+  private async readObsidianIndex(): Promise<ZoteroObsidianIndex | null> {
+    const path = normalizePath(`${this.settings.targetFolder}/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return null;
+    return JSON.parse(await this.app.vault.read(file)) as ZoteroObsidianIndex;
   }
 
   private registerContextMenus(): void {
@@ -413,6 +702,11 @@ function trimSlash(value: string): string {
   return value.replace(/\/+$/g, "");
 }
 
+function stripOuterParens(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.startsWith("(") && trimmed.endsWith(")") ? trimmed.slice(1, -1).trim() : trimmed;
+}
+
 async function fetchBridgeJson<T>(url: string): Promise<T> {
   const errors: string[] = [];
   for (const candidate of bridgeUrlCandidates(url)) {
@@ -432,6 +726,41 @@ async function fetchBridgeJson<T>(url: string): Promise<T> {
           Accept: "application/json",
           "Cache-Control": "no-cache"
         }
+      });
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return response.json as T;
+    } catch (error) {
+      errors.push(`requestUrl ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  throw new Error(errors.join("; "));
+}
+
+async function postBridgeJson<T>(url: string, payload: unknown): Promise<T> {
+  const errors: string[] = [];
+  const body = JSON.stringify(payload);
+  for (const candidate of bridgeUrlCandidates(url)) {
+    if (isLocalBridgeUrl(candidate)) {
+      try {
+        return (await requestJsonWithNode(candidate, { method: "POST", body })) as T;
+      } catch (error) {
+        errors.push(`node ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    try {
+      const response = await requestUrl({
+        method: "POST",
+        url: candidate,
+        headers: {
+          Accept: "application/json",
+          "Cache-Control": "no-cache",
+          "Content-Type": "application/json"
+        },
+        body
       });
       if (response.status < 200 || response.status >= 300) {
         throw new Error(`HTTP ${response.status}`);
@@ -471,9 +800,20 @@ function isLocalBridgeUrl(url: string): boolean {
   }
 }
 
-async function requestJsonWithNode(url: string): Promise<unknown> {
+async function requestJsonWithNode(
+  url: string,
+  options: { method?: "GET" | "POST"; body?: string } = {}
+): Promise<unknown> {
   const parsed = new URL(url);
   const requester = require(parsed.protocol === "https:" ? "https" : "http") as typeof import("http");
+  const method = options.method || "GET";
+  const headers: Record<string, string | number> = {
+    Accept: "application/json"
+  };
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    headers["Content-Length"] = Buffer.byteLength(options.body);
+  }
 
   return new Promise((resolve, reject) => {
     const request = requester.request(
@@ -481,29 +821,47 @@ async function requestJsonWithNode(url: string): Promise<unknown> {
         hostname: parsed.hostname,
         port: parsed.port,
         path: `${parsed.pathname}${parsed.search}`,
-        method: "GET",
+        method,
         family: parsed.hostname === "localhost" ? 4 : undefined,
-        headers: {
-          Accept: "application/json"
-        },
+        headers,
         timeout: 30000
       },
       (response) => {
         let body = "";
+        let settled = false;
+        const finish = (value: unknown) => {
+          if (settled) return;
+          settled = true;
+          resolve(value);
+          request.destroy();
+        };
+        const fail = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          reject(error);
+        };
         response.setEncoding("utf8");
         response.on("data", (chunk) => {
           body += chunk;
+          const status = response.statusCode || 0;
+          if (status < 200 || status >= 300) return;
+          const parsed = tryParseJson(body);
+          if (parsed.ok) {
+            finish(parsed.value);
+          }
         });
         response.on("end", () => {
+          if (settled) return;
           const status = response.statusCode || 0;
           if (status < 200 || status >= 300) {
-            reject(new Error(`HTTP ${status}`));
+            fail(new Error(`HTTP ${status}`));
             return;
           }
-          try {
-            resolve(JSON.parse(body));
-          } catch (error) {
-            reject(new Error(`Invalid JSON response: ${error instanceof Error ? error.message : String(error)}`));
+          const parsed = tryParseJson(body);
+          if (parsed.ok) {
+            finish(parsed.value);
+          } else {
+            fail(new Error(`Invalid JSON response: ${parsed.error}`));
           }
         });
       }
@@ -511,6 +869,17 @@ async function requestJsonWithNode(url: string): Promise<unknown> {
 
     request.on("error", reject);
     request.on("timeout", () => request.destroy(new Error("Request timed out")));
+    if (options.body !== undefined) {
+      request.write(options.body);
+    }
     request.end();
   });
+}
+
+function tryParseJson(value: string): { ok: true; value: unknown } | { ok: false; error: string } {
+  try {
+    return { ok: true, value: JSON.parse(value) };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }

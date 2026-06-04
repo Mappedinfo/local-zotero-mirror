@@ -3,3 +3,45 @@
   font-size: var(--font-ui-smaller);
   margin-top: 0.5rem;
 }
+
+.local-zotero-citation {
+  color: var(--text-accent);
+  cursor: help;
+  font-variant-numeric: oldstyle-nums;
+}
+
+.local-zotero-citation.is-cached {
+  color: var(--text-muted);
+  text-decoration: underline dotted;
+  text-underline-offset: 0.16em;
+}
+
+.local-zotero-citation.is-missing {
+  color: var(--text-error);
+  font-weight: 600;
+}
+
+.local-zotero-references {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 2rem;
+  padding-top: 1rem;
+}
+
+.local-zotero-references h2 {
+  margin-top: 0;
+}
+
+.local-zotero-references-status,
+.local-zotero-references-missing {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin: 0.25rem 0 0.75rem;
+}
+
+.local-zotero-references-missing {
+  color: var(--text-error);
+}
+
+.local-zotero-references ol {
+  padding-left: 1.5rem;
+}
