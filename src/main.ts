@@ -22,8 +22,10 @@ import {
   OBSIDIAN_ZOTERO_INDEX_FILE_NAME,
   assertZoteroSnapshot,
   buildCitationRenderRanges,
+  citationActionState,
   citationGroupKey,
   dirname,
+  findObsidianIndexItemForCitation,
   findPandocCitationGroups,
   syncSnapshotToStore,
   uniqueCitationGroups,
@@ -35,12 +37,14 @@ import {
   type ZoteroBridgeSnapshot,
   type ZoteroBridgeStatus,
   type ZoteroCitationItem,
+  type CurrentCitationActionState,
   type ZoteroCitationMetadata,
   type ZoteroCitationResponse,
   type ZoteroObsidianIndex
 } from "../packages/shared/src/index.ts";
 
 type ZoteroUriField = "zotero_uri" | "pdf_uri";
+type ElectronShell = { openExternal: (uri: string) => Promise<void> };
 
 interface CitationDocumentState {
   sourcePath: string;
@@ -376,7 +380,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     entry: ZoteroCitationItem,
     index: ZoteroObsidianIndex | null
   ): CurrentCitationPanelEntry {
-    const indexItem = index?.items[entry.itemKey];
+    const indexItem = findObsidianIndexItemForCitation(entry, index);
     const notePath = entry.path || indexItem?.path;
     const noteFile = notePath ? this.getMarkdownFile(notePath) : null;
     return {
@@ -766,7 +770,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       new Notice(messages.missingLinkMessage);
       return;
     }
-    window.open(uri);
+    void openExternalUri(uri, messages.missingLinkMessage);
   }
 
   private registerConfiguredInterval(): void {
@@ -990,37 +994,92 @@ class CurrentCitationsView extends ItemView {
     }
 
     const actions = item.createEl("div", { cls: "local-zotero-current-citation-actions" });
-    this.addActionButton(actions, "Open note", Boolean(entry.notePath), () => {
-      if (entry.notePath) {
-        const file = this.app.vault.getAbstractFileByPath(normalizePath(entry.notePath));
-        if (file instanceof TFile) {
-          void this.app.workspace.getLeaf(false).openFile(file);
-        } else {
-          void this.app.workspace.openLinkText(entry.notePath, sourcePath, false);
-        }
+    this.addActionButton(actions, "Open note", citationActionState("note", entry), async () => {
+      await this.openCitationNote(entry.notePath, sourcePath);
+    });
+    this.addActionButton(actions, "Zotero", citationActionState("zotero", entry), async () => {
+      await openExternalUri(entry.zoteroUri, "缺少 Zotero 链接，无法打开条目。");
+    });
+    this.addActionButton(actions, "PDF", citationActionState("pdf", entry), async () => {
+      await openExternalUri(entry.pdfUri, "缺少 PDF 链接，无法打开附件。");
+    });
+  }
+
+  private async openCitationNote(notePath: string | undefined, sourcePath: string): Promise<void> {
+    if (!notePath) {
+      new Notice("尚未同步本地 note，无法打开。");
+      return;
+    }
+    const normalizedPath = normalizePath(notePath);
+    const file = this.app.vault.getAbstractFileByPath(normalizedPath);
+    try {
+      if (file instanceof TFile) {
+        await this.app.workspace.getLeaf("tab").openFile(file);
+      } else {
+        await this.app.workspace.openLinkText(normalizedPath, sourcePath, true);
       }
-    });
-    this.addActionButton(actions, "Zotero", Boolean(entry.zoteroUri), () => {
-      if (entry.zoteroUri) window.open(entry.zoteroUri);
-    });
-    this.addActionButton(actions, "PDF", Boolean(entry.pdfUri), () => {
-      if (entry.pdfUri) window.open(entry.pdfUri);
-    });
+    } catch (error) {
+      new Notice(`打开本地 note 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private addActionButton(
     container: HTMLElement,
     label: string,
-    enabled: boolean,
-    onClick: () => void
+    state: CurrentCitationActionState,
+    onClick: () => Promise<void>
   ): void {
     const button = container.createEl("button", {
       cls: "local-zotero-current-citation-action",
       text: label
     });
     button.type = "button";
-    button.disabled = !enabled;
-    button.addEventListener("click", onClick);
+    button.disabled = !state.enabled;
+    button.title = state.title;
+    if (state.target) button.dataset.target = state.target;
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!state.enabled) {
+        new Notice(state.title);
+        return;
+      }
+      void onClick();
+    });
+  }
+}
+
+
+async function openExternalUri(uri: string | undefined, missingMessage: string): Promise<void> {
+  if (!uri) {
+    new Notice(missingMessage);
+    return;
+  }
+
+  try {
+    const electronShell = getElectronShell();
+    if (electronShell) {
+      await electronShell.openExternal(uri);
+      return;
+    }
+    window.open(uri);
+  } catch (error) {
+    try {
+      window.open(uri);
+      return;
+    } catch {
+      // Report the original Electron error below when both routes fail.
+    }
+    new Notice(`打开外部链接失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function getElectronShell(): ElectronShell | null {
+  try {
+    const electron = require("electron") as { shell?: ElectronShell };
+    return electron.shell ?? null;
+  } catch {
+    return null;
   }
 }
 

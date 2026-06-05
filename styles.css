@@ -111,7 +111,13 @@
 }
 
 .local-zotero-current-citation-action {
+  cursor: pointer;
   font-size: var(--font-ui-smaller);
   min-height: 24px;
   padding: 2px 8px;
+}
+
+.local-zotero-current-citation-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
