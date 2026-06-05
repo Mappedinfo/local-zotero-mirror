@@ -22,6 +22,7 @@ import {
   OBSIDIAN_ZOTERO_INDEX_FILE_NAME,
   assertZoteroSnapshot,
   buildCitationRenderRanges,
+  buildObsidianIndexFromNotes,
   citationActionState,
   citationGroupKey,
   dirname,
@@ -87,6 +88,7 @@ const DEFAULT_SETTINGS: ConnectorSettings = {
 };
 
 const CURRENT_CITATIONS_VIEW_TYPE = "local-zotero-current-citations";
+const INTERNAL_ZOTERO_INDEX_FILE_NAME = "zotero-index.json";
 const CITATION_WIDGET_CLASS = "local-zotero-editor-citation";
 const citationRenderEffect = StateEffect.define<CitationDocumentState | null>();
 const citationDocumentStateField = StateField.define<CitationDocumentState | null>({
@@ -326,10 +328,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       return { file, sourcePath: file.path, response: null, entries: [], missingCitekeys: [] };
     }
 
-    const index = await this.readObsidianIndex().catch((error) => {
-      console.warn("[local-zotero-mirror] Failed to read Obsidian Zotero index", error);
-      return null;
-    });
+    const index = await this.getOrBuildObsidianIndex();
     const entries = await Promise.all(response.entries.map((entry) => this.enrichCitationPanelEntry(entry, index)));
     return {
       file,
@@ -517,7 +516,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       }
     }
 
-    const index = await this.readObsidianIndex().catch(() => null);
+    const index = await this.getOrBuildObsidianIndex();
     if (index) {
       source = source === "missing" ? "obsidian-index" : source;
       for (const item of Object.values(index.items)) {
@@ -676,19 +675,85 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     return block;
   }
 
+  private async getOrBuildObsidianIndex(): Promise<ZoteroObsidianIndex | null> {
+    try {
+      const index = await this.readObsidianIndex();
+      if (index) return index;
+    } catch (error) {
+      console.warn("[local-zotero-mirror] Failed to read Obsidian Zotero index", error);
+    }
+    return this.rebuildObsidianIndexFromSyncedNotes();
+  }
+
   private async readObsidianIndex(): Promise<ZoteroObsidianIndex | null> {
-    const path = normalizePath(`${this.settings.targetFolder}/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`);
+    const path = this.obsidianIndexPath();
+    const index = await this.readObsidianIndexAtPath(path);
+    if (index) return index;
+
+    const legacyPath = this.legacyObsidianIndexPath();
+    const legacyIndex = await this.readObsidianIndexAtPath(legacyPath);
+    if (legacyIndex) {
+      await this.writeObsidianIndex(legacyIndex);
+      console.info("[local-zotero-mirror] Migrated Obsidian Zotero index to plugin state", {
+        from: legacyPath,
+        to: path
+      });
+      return legacyIndex;
+    }
+
+    console.info("[local-zotero-mirror] Obsidian Zotero index not found; rebuilding from synced notes", { path, legacyPath });
+    return null;
+  }
+
+  private async readObsidianIndexAtPath(path: string): Promise<ZoteroObsidianIndex | null> {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFile) {
       return JSON.parse(await this.app.vault.read(file)) as ZoteroObsidianIndex;
     }
-
     if (await this.app.vault.adapter.exists(path)) {
       return JSON.parse(await this.app.vault.adapter.read(path)) as ZoteroObsidianIndex;
     }
-
-    console.warn("[local-zotero-mirror] Obsidian Zotero index not found", { path });
     return null;
+  }
+
+  private async rebuildObsidianIndexFromSyncedNotes(): Promise<ZoteroObsidianIndex | null> {
+    const store = new ObsidianNoteStore(this.app);
+    const records = await store.listMarkdownFiles(this.settings.targetFolder);
+    const index = buildObsidianIndexFromNotes(records, this.settings, new Date().toISOString());
+    if (!index) {
+      console.warn("[local-zotero-mirror] Could not rebuild Obsidian Zotero index; no synced Zotero notes found", {
+        targetFolder: this.settings.targetFolder
+      });
+      return null;
+    }
+
+    await this.writeObsidianIndex(index);
+    console.info("[local-zotero-mirror] Rebuilt Obsidian Zotero index from synced notes", {
+      path: this.obsidianIndexPath(),
+      items: Object.keys(index.items).length,
+      standaloneNotes: Object.keys(index.standaloneNotes).length
+    });
+    return index;
+  }
+
+  private async writeObsidianIndex(index: ZoteroObsidianIndex): Promise<void> {
+    const directory = this.pluginStateDirectory();
+    if (!(await this.app.vault.adapter.exists(directory))) {
+      await this.app.vault.adapter.mkdir(directory);
+    }
+    await this.app.vault.adapter.write(this.obsidianIndexPath(), `${JSON.stringify(index, null, 2)}\n`);
+  }
+
+  private obsidianIndexPath(): string {
+    return normalizePath(`${this.pluginStateDirectory()}/${INTERNAL_ZOTERO_INDEX_FILE_NAME}`);
+  }
+
+  private legacyObsidianIndexPath(): string {
+    return normalizePath(`${this.settings.targetFolder}/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`);
+  }
+
+  private pluginStateDirectory(): string {
+    return normalizePath(this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`);
   }
 
   private registerContextMenus(): void {
