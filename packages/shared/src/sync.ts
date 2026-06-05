@@ -164,6 +164,7 @@ export async function syncSnapshotToStore(
     nativeNotesByParentItemKey,
     activeStandaloneNotes,
     standaloneNotePathsByKey,
+    noteContentsByPath,
     settings,
     store,
     now,
@@ -413,6 +414,7 @@ async function writeObsidianIndex(args: {
   nativeNotesByParentItemKey: Map<string, ZoteroNativeNote[]>;
   activeStandaloneNotes: ZoteroNativeNote[];
   standaloneNotePathsByKey: Map<string, string>;
+  noteContentsByPath: Map<string, string>;
   settings: SyncSettings;
   store: NoteStore;
   now: string;
@@ -425,6 +427,7 @@ async function writeObsidianIndex(args: {
     nativeNotesByParentItemKey,
     activeStandaloneNotes,
     standaloneNotePathsByKey,
+    noteContentsByPath,
     settings,
     store,
     now,
@@ -444,6 +447,7 @@ async function writeObsidianIndex(args: {
   for (const item of activeItems) {
     const path = notePathsByItemKey.get(item.key);
     if (!path) continue;
+    const content = noteContentsByPath.get(path) || "";
     index.items[item.key] = {
       itemKey: item.key,
       path,
@@ -452,6 +456,9 @@ async function writeObsidianIndex(args: {
       citation: item.citation,
       zoteroUri: item.zoteroUri,
       nativeNoteCount: nativeNotesByParentItemKey.get(item.key)?.length ?? 0,
+      obsidianNoteKey: readFrontmatterString(content, "obsidian_note_key"),
+      obsidianNoteHash: readFrontmatterString(content, "obsidian_note_hash"),
+      obsidianNoteSyncStatus: readFrontmatterString(content, "obsidian_note_sync_status"),
       lastSynced: now
     };
   }

@@ -27,7 +27,11 @@ export const MANAGED_FRONTMATTER_KEYS = [
   "zotero_deleted",
   "zotero_note_key",
   "zotero_parent_key",
-  "zotero_note_deleted"
+  "zotero_note_deleted",
+  "obsidian_note_key",
+  "obsidian_note_hash",
+  "obsidian_note_last_synced",
+  "obsidian_note_sync_status"
 ] as const;
 
 export function splitFrontmatter(markdown: string): { frontmatter: string[]; body: string } {

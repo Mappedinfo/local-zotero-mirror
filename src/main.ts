@@ -28,7 +28,11 @@ import {
   citationGroupKey,
   dirname,
   findObsidianIndexItemForCitation,
+  extractUserNotesMarkdown,
   findPandocCitationGroups,
+  hasUserNotesBlock,
+  hashObsidianUserNotes,
+  mergeManagedFrontmatter,
   missingCitekeyGuidance,
   missingCitekeySummary,
   readFrontmatterString,
@@ -46,7 +50,8 @@ import {
   type CurrentCitationActionState,
   type ZoteroCitationMetadata,
   type ZoteroCitationResponse,
-  type ZoteroObsidianIndex
+  type ZoteroObsidianIndex,
+  type ZoteroObsidianNoteSyncResponse
 } from "../packages/shared/src/index.ts";
 
 type ZoteroUriField = "zotero_uri" | "pdf_uri";
@@ -75,6 +80,7 @@ interface CurrentCitationsPanelData {
   response: ZoteroCitationResponse | null;
   entries: CurrentCitationPanelEntry[];
   missingCitekeys: string[];
+  writebackStatus?: string;
 }
 
 interface ConnectorSettings extends SyncSettings {
@@ -115,6 +121,9 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
   private editorViews = new Set<EditorView>();
   private editorResolveTimers = new Map<string, number>();
   private currentCitationsRefreshTimer: number | null = null;
+  private obsidianNoteWritebackTimers = new Map<string, number>();
+  private suppressedWritebackPaths = new Set<string>();
+  private syncInProgress = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -158,9 +167,22 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       callback: () => this.openCurrentCitationsPanel()
     });
 
+    this.addCommand({
+      id: "sync-current-obsidian-note-to-zotero",
+      name: "Sync Current Obsidian Note to Zotero",
+      callback: () => this.syncCurrentObsidianNoteToZotero()
+    });
+
+    this.addCommand({
+      id: "sync-all-obsidian-notes-to-zotero",
+      name: "Sync All Obsidian Notes to Zotero",
+      callback: () => this.syncAllObsidianNotesToZotero()
+    });
+
     this.registerContextMenus();
     this.registerMarkdownPostProcessor((element, context) => this.renderPandocCitations(element, context));
     this.registerCitationPanelEvents();
+    this.registerObsidianNoteWritebackEvents();
     this.registerConfiguredInterval();
     this.app.workspace.onLayoutReady(() => {
       void this.openCurrentCitationsPanel({ reveal: false });
@@ -177,6 +199,10 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       window.clearTimeout(this.currentCitationsRefreshTimer);
       this.currentCitationsRefreshTimer = null;
     }
+    for (const timer of this.obsidianNoteWritebackTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.obsidianNoteWritebackTimers.clear();
     this.app.workspace.detachLeavesOfType(CURRENT_CITATIONS_VIEW_TYPE);
   }
 
@@ -207,6 +233,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
   }
 
   async runSync(options: { dryRun: boolean; silent?: boolean }): Promise<void> {
+    this.syncInProgress = true;
     try {
       const snapshot = await this.fetchSnapshot();
       const store = new ObsidianNoteStore(this.app);
@@ -215,6 +242,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
         now: new Date().toISOString()
       });
       if (!options.dryRun) {
+        this.suppressWritebackForPaths(result.operations.map((operation) => operation.path));
         await this.migrateGeneratedIndexFilesToPluginState();
       }
 
@@ -229,6 +257,8 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       if (!options.silent) {
         new Notice(`Zotero sync failed: ${error instanceof Error ? error.message : String(error)}`);
       }
+    } finally {
+      this.syncInProgress = false;
     }
   }
 
@@ -332,7 +362,14 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     const state = await this.resolveCitationDocumentState(file.path, markdown);
     const response = state.response;
     if (!response) {
-      return { file, sourcePath: file.path, response: null, entries: [], missingCitekeys: [] };
+      return {
+        file,
+        sourcePath: file.path,
+        response: null,
+        entries: [],
+        missingCitekeys: [],
+        writebackStatus: readFrontmatterString(markdown, "obsidian_note_sync_status")
+      };
     }
 
     const index = await this.getOrBuildObsidianIndex();
@@ -342,8 +379,180 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       sourcePath: file.path,
       response,
       entries,
-      missingCitekeys: response.missingCitekeys
+      missingCitekeys: response.missingCitekeys,
+      writebackStatus: readFrontmatterString(markdown, "obsidian_note_sync_status")
     };
+  }
+
+  private registerObsidianNoteWritebackEvents(): void {
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (file instanceof TFile) {
+          this.scheduleObsidianNoteWriteback(file);
+        }
+      })
+    );
+  }
+
+  private scheduleObsidianNoteWriteback(file: TFile): void {
+    if (this.syncInProgress || file.extension !== "md" || this.suppressedWritebackPaths.has(file.path)) return;
+    const existing = this.obsidianNoteWritebackTimers.get(file.path);
+    if (existing !== undefined) window.clearTimeout(existing);
+    const timer = window.setTimeout(() => {
+      this.obsidianNoteWritebackTimers.delete(file.path);
+      void this.syncObsidianNoteFile(file, { silent: true, reason: "auto" }).catch((error) => {
+        console.error("[local-zotero-mirror] Obsidian note writeback failed", error);
+      });
+    }, 3000);
+    this.obsidianNoteWritebackTimers.set(file.path, timer);
+  }
+
+  private async syncCurrentObsidianNoteToZotero(): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!(file instanceof TFile) || file.extension !== "md") {
+      new Notice("当前没有打开 Markdown paper note。");
+      return;
+    }
+    const result = await this.syncObsidianNoteFile(file, { silent: false, reason: "manual" });
+    if (result.status === "skipped") {
+      new Notice(result.message || "当前 note 没有可回写的 Obsidian 用户块。");
+    }
+  }
+
+  private async syncAllObsidianNotesToZotero(): Promise<void> {
+    const papersRoot = normalizePath(`${this.settings.targetFolder}/${this.settings.papersFolderName}`);
+    const files = this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(`${papersRoot}/`));
+    let synced = 0;
+    let skipped = 0;
+    let conflicts = 0;
+    let failed = 0;
+    for (const file of files) {
+      const result = await this.syncObsidianNoteFile(file, { silent: true, reason: "manual-all" });
+      if (result.status === "synced") synced += 1;
+      else if (result.status === "conflict") conflicts += 1;
+      else if (result.status === "failed") failed += 1;
+      else skipped += 1;
+    }
+    new Notice(`Obsidian notes writeback: ${synced} synced, ${conflicts} conflicts, ${failed} failed, ${skipped} skipped.`);
+  }
+
+  private async syncObsidianNoteFile(
+    file: TFile,
+    options: { silent: boolean; reason: "auto" | "manual" | "manual-all" }
+  ): Promise<{ status: "synced" | "conflict" | "failed" | "skipped"; message?: string }> {
+    const markdown = this.getActiveMarkdownText(file) ?? (await this.app.vault.cachedRead(file));
+    const itemKey = readFrontmatterString(markdown, "zotero_key");
+    if (!itemKey) return { status: "skipped", message: "缺少 zotero_key。" };
+    if (!hasUserNotesBlock(markdown)) return { status: "skipped", message: "缺少 Obsidian 用户笔记块。" };
+    const userMarkdown = extractUserNotesMarkdown(markdown);
+    if (userMarkdown === null) return { status: "skipped", message: "Obsidian 用户笔记块不完整。" };
+
+    const contentHash = hashObsidianUserNotes(userMarkdown);
+    const baseHash = readFrontmatterString(markdown, "obsidian_note_hash") || "";
+    if (options.reason === "auto" && baseHash === contentHash && readFrontmatterString(markdown, "obsidian_note_sync_status") === "synced") {
+      return { status: "skipped" };
+    }
+
+    const noteKey = readFrontmatterString(markdown, "obsidian_note_key");
+    try {
+      const response = await postBridgeJson<ZoteroObsidianNoteSyncResponse>(`${trimSlash(this.settings.bridgeUrl)}/obsidian-note`, {
+        itemKey,
+        sourcePath: file.path,
+        markdown: userMarkdown,
+        contentHash,
+        baseHash,
+        noteKey
+      });
+
+      if (response.status === "conflict") {
+        const conflictPath = await this.writeObsidianNoteConflictFile(file, itemKey, userMarkdown, response);
+        await this.updateObsidianNoteSyncFrontmatter(file, markdown, {
+          obsidian_note_key: response.noteKey || noteKey,
+          obsidian_note_sync_status: "conflict",
+          obsidian_note_last_synced: new Date().toISOString()
+        });
+        if (!options.silent) new Notice(`Obsidian/Zotero note conflict: ${conflictPath}`);
+        return { status: "conflict", message: conflictPath };
+      }
+
+      if (!response.ok) throw new Error(response.error || `Bridge returned ${response.status}`);
+      if (!["created", "updated", "unchanged"].includes(response.status)) {
+        throw new Error(response.error || `Unexpected writeback status: ${response.status}`);
+      }
+
+      await this.updateObsidianNoteSyncFrontmatter(file, markdown, {
+        obsidian_note_key: response.noteKey || noteKey,
+        obsidian_note_hash: contentHash,
+        obsidian_note_last_synced: new Date().toISOString(),
+        obsidian_note_sync_status: "synced"
+      });
+      if (!options.silent) new Notice(`Obsidian note synced to Zotero: ${response.status}`);
+      return { status: "synced" };
+    } catch (error) {
+      await this.updateObsidianNoteSyncFrontmatter(file, markdown, {
+        obsidian_note_sync_status: "failed",
+        obsidian_note_last_synced: new Date().toISOString()
+      });
+      const message = error instanceof Error ? error.message : String(error);
+      if (!options.silent) new Notice(`Obsidian note writeback failed: ${message}`);
+      return { status: "failed", message };
+    }
+  }
+
+  private async updateObsidianNoteSyncFrontmatter(file: TFile, original: string, fields: Record<string, string | undefined>): Promise<void> {
+    const content = await this.app.vault.cachedRead(file);
+    const next = mergeManagedFrontmatter(content || original, fields);
+    if (next === content) return;
+    this.suppressWritebackForPaths([file.path]);
+    await this.app.vault.modify(file, next);
+  }
+
+  private async writeObsidianNoteConflictFile(
+    sourceFile: TFile,
+    itemKey: string,
+    localMarkdown: string,
+    response: ZoteroObsidianNoteSyncResponse
+  ): Promise<string> {
+    const folder = normalizePath(`${this.settings.targetFolder}/_Conflicts`);
+    await new ObsidianNoteStore(this.app).ensureFolder(folder);
+    const citekey = readFrontmatterString(await this.app.vault.cachedRead(sourceFile), "citekey") || itemKey;
+    const baseName = safeFileToken(`${citekey}-${timestampForFileName(new Date())}`);
+    let path = normalizePath(`${folder}/${baseName}.md`);
+    let suffix = 1;
+    while (this.app.vault.getAbstractFileByPath(path)) {
+      path = normalizePath(`${folder}/${baseName}-${suffix}.md`);
+      suffix += 1;
+    }
+    const content = [
+      "---",
+      `source_note: "${sourceFile.path.replace(/"/g, "'")}"`,
+      `zotero_key: "${itemKey}"`,
+      response.noteKey ? `obsidian_note_key: "${response.noteKey}"` : undefined,
+      'conflict_type: "obsidian-zotero-note"',
+      `created: "${new Date().toISOString()}"`,
+      "---",
+      "",
+      "# Obsidian/Zotero note conflict",
+      "",
+      "## Local Obsidian version",
+      "",
+      localMarkdown.trim() || "_Empty local note._",
+      "",
+      "## Zotero version",
+      "",
+      response.remoteMarkdown?.trim() || "_Empty Zotero note._"
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    await this.app.vault.create(path, `${content}\n`);
+    return path;
+  }
+
+  private suppressWritebackForPaths(paths: string[]): void {
+    for (const path of paths.map((entry) => normalizePath(entry)).filter(Boolean)) {
+      this.suppressedWritebackPaths.add(path);
+      window.setTimeout(() => this.suppressedWritebackPaths.delete(path), 5000);
+    }
   }
 
   private registerCitationPanelEvents(): void {
@@ -1098,6 +1307,13 @@ class CurrentCitationsView extends ItemView {
       text: data.file.basename
     });
 
+    if (data.writebackStatus) {
+      container.createEl("p", {
+        cls: `local-zotero-current-citations-status is-writeback-${data.writebackStatus}`,
+        text: `Obsidian note sync: ${data.writebackStatus}`
+      });
+    }
+
     if (!data.response || data.entries.length === 0) {
       if (data.missingCitekeys.length > 0) {
         this.renderMissingCitekeyHelp(container, data.missingCitekeys, data.response || undefined);
@@ -1212,6 +1428,19 @@ class CurrentCitationsView extends ItemView {
   }
 }
 
+
+function safeFileToken(value: string): string {
+  return String(value || "untitled")
+    .normalize("NFKC")
+    .replace(/[\\/:*?"<>|#^[\]]+/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120) || "untitled";
+}
+
+function timestampForFileName(date: Date): string {
+  return date.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+}
 
 function createMissingCitekeyHelp(citekeys: string[], response?: ZoteroCitationResponse): HTMLElement {
   const help = document.createElement("div");

@@ -4,6 +4,10 @@ import {
   DEFAULT_SYNC_SETTINGS,
   OBSIDIAN_ZOTERO_INDEX_FILE_NAME,
   OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME,
+  USER_NOTES_BLOCK_END,
+  USER_NOTES_BLOCK_START,
+  extractUserNotesMarkdown,
+  hashObsidianUserNotes,
   htmlToMarkdown,
   syncSnapshotToStore,
   type NoteRecord,
@@ -89,6 +93,34 @@ test("syncSnapshotToStore creates canonical paper notes and collection indexes",
   assert.match(paper, /tags:\n  - "zotero\/health-services-accessibility"\n  - "zotero\/child-preschool"/);
   assert.match(paper, /zotero_tags:\n  - "Health Services Accessibility"\n  - "Child, Preschool"/);
   assert.doesNotMatch(paper, /^tags:\n  - "Health Services Accessibility"/m);
+});
+
+test("syncSnapshotToStore creates and migrates explicit Obsidian user note blocks", async () => {
+  const store = new MemoryStore();
+  await syncSnapshotToStore(snapshotFixture(), store, DEFAULT_SYNC_SETTINGS, {
+    now: "2026-06-02T00:00:00.000Z"
+  });
+
+  const path = "Zotero/Papers/2024 - Smith - Multi Collection Paper.md";
+  const created = store.files.get(path)!;
+  assert.match(created, new RegExp(USER_NOTES_BLOCK_START));
+  assert.match(created, /## Summary/);
+  assert.equal(extractUserNotesMarkdown(created)?.includes("## Method"), true);
+
+  const legacy = created
+    .replace(`${USER_NOTES_BLOCK_START}\n`, "")
+    .replace(`\n${USER_NOTES_BLOCK_END}`, "")
+    .replace("## Summary", "## Summary\nLegacy local reading note.\n");
+  store.files.set(path, legacy);
+  await syncSnapshotToStore(snapshotFixture({ title: "Multi Collection Paper Revised" }), store, DEFAULT_SYNC_SETTINGS, {
+    now: "2026-06-03T00:00:00.000Z"
+  });
+
+  const migrated = store.files.get(path)!;
+  assert.match(migrated, /Multi Collection Paper Revised/);
+  assert.match(migrated, new RegExp(USER_NOTES_BLOCK_START));
+  assert.match(extractUserNotesMarkdown(migrated) || "", /Legacy local reading note/);
+  assert.equal(hashObsidianUserNotes("## Summary\n\nA"), hashObsidianUserNotes("## Summary\nA"));
 });
 
 test("syncSnapshotToStore preserves user note sections on repeat sync", async () => {

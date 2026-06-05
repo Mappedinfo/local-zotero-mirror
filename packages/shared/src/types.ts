@@ -1,6 +1,7 @@
 export type ZoteroLibraryType = "user" | "group";
 export type LibraryScope = "all" | ZoteroLibraryType;
 export type DeleteBehavior = "mark" | "archive" | "ignore";
+export type ObsidianNoteSyncStatus = "created" | "updated" | "unchanged" | "conflict" | "failed" | "synced" | "pending";
 
 export interface ZoteroBridgeStatus {
   ok: boolean;
@@ -169,6 +170,9 @@ export interface ZoteroObsidianIndexItem {
   citation?: ZoteroCitationMetadata;
   zoteroUri?: string;
   nativeNoteCount: number;
+  obsidianNoteKey?: string;
+  obsidianNoteHash?: string;
+  obsidianNoteSyncStatus?: string;
   lastSynced: string;
 }
 
@@ -225,6 +229,21 @@ export interface ZoteroCitationGroupResult {
   rendered: string;
   missing: string[];
   items: ZoteroCitationItem[];
+}
+
+export interface ZoteroObsidianNoteSyncResponse {
+  ok: boolean;
+  status: "created" | "updated" | "unchanged" | "conflict" | "missing" | "missing-item" | "failed" | "found";
+  itemKey?: string;
+  noteKey?: string;
+  zoteroVersion?: number;
+  contentHash?: string;
+  remoteHash?: string;
+  markerHash?: string;
+  remoteMarkdown?: string;
+  markdown?: string;
+  sourcePath?: string;
+  error?: string;
 }
 
 export interface ZoteroCitationResponse {

@@ -7,6 +7,8 @@ export const MANAGED_BLOCK_END = "<!-- END OBSIDIAN-ZOTERO-METADATA -->";
 export const NATIVE_NOTES_HEADING = "# zotero原生笔记迁移";
 export const NATIVE_NOTES_BLOCK_START = "<!-- BEGIN OBSIDIAN-ZOTERO-NATIVE-NOTES -->";
 export const NATIVE_NOTES_BLOCK_END = "<!-- END OBSIDIAN-ZOTERO-NATIVE-NOTES -->";
+export const USER_NOTES_BLOCK_START = "<!-- BEGIN OBSIDIAN-ZOTERO-USER-NOTES -->";
+export const USER_NOTES_BLOCK_END = "<!-- END OBSIDIAN-ZOTERO-USER-NOTES -->";
 
 export function buildManagedFields(
   item: ZoteroItem,
@@ -96,7 +98,7 @@ export function paperNoteTemplate(): string {
 }
 
 export function renderNewPaperNote(item: ZoteroItem, now: string, collectionLabels: string[]): string {
-  const shell = `${renderMetadataBlock(item, collectionLabels)}\n\n${paperNoteTemplate()}`;
+  const shell = `${renderMetadataBlock(item, collectionLabels)}\n\n${renderUserNotesBlock(paperNoteTemplate())}`;
   return mergeManagedFrontmatter(shell, buildManagedFields(item, now, collectionLabels));
 }
 
@@ -128,7 +130,8 @@ export function mergeExistingPaperNote(
     buildManagedFields(item, now, collectionLabels, deleted, shouldManageNativeNotes ? nativeNotes.length : undefined)
   );
   const withMetadata = upsertManagedBlock(withFrontmatter, renderMetadataBlock(item, collectionLabels, deleted));
-  return shouldManageNativeNotes ? upsertNativeNotesBlock(withMetadata, nativeNotes, now) : withMetadata;
+  const withNativeNotes = shouldManageNativeNotes ? upsertNativeNotesBlock(withMetadata, nativeNotes, now) : withMetadata;
+  return deleted ? withNativeNotes : ensureUserNotesBlock(withNativeNotes);
 }
 
 export function upsertManagedBlock(markdown: string, block: string): string {
@@ -150,6 +153,72 @@ export function upsertManagedBlock(markdown: string, block: string): string {
   }
 
   return `${block}\n\n${markdown.replace(/^\n*/, "")}`.replace(/\n+$/, "\n");
+}
+
+export function renderUserNotesBlock(markdown: string): string {
+  return [USER_NOTES_BLOCK_START, normalizeUserNotesMarkdown(markdown) || paperNoteTemplate().trim(), USER_NOTES_BLOCK_END]
+    .join("\n")
+    .replace(/\n+$/, "\n");
+}
+
+export function hasUserNotesBlock(markdown: string): boolean {
+  return markdown.includes(USER_NOTES_BLOCK_START) && markdown.includes(USER_NOTES_BLOCK_END);
+}
+
+export function extractUserNotesMarkdown(markdown: string): string | null {
+  const startIndex = markdown.indexOf(USER_NOTES_BLOCK_START);
+  const endIndex = markdown.indexOf(USER_NOTES_BLOCK_END);
+  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) return null;
+  return markdown.slice(startIndex + USER_NOTES_BLOCK_START.length, endIndex).replace(/^\n/, "").replace(/\n$/, "");
+}
+
+export function ensureUserNotesBlock(markdown: string): string {
+  if (hasUserNotesBlock(markdown)) return markdown;
+  const insertionPoint = findUserNotesInsertionPoint(markdown);
+  const before = markdown.slice(0, insertionPoint).replace(/\n*$/, "\n\n");
+  const userMarkdown = markdown.slice(insertionPoint).trim();
+  return `${before}${renderUserNotesBlock(userMarkdown)}\n`.replace(/\n+$/, "\n");
+}
+
+export function hashObsidianUserNotes(markdown: string): string {
+  const text = canonicalUserNotesMarkdown(markdown);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `fnv1a32:${hash.toString(16).padStart(8, "0")}`;
+}
+
+function canonicalUserNotesMarkdown(markdown: string): string {
+  return normalizeUserNotesMarkdown(markdown)
+    .split("\n")
+    .map((line) => line.replace(/\s+$/g, ""))
+    .join("\n")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+}
+
+function normalizeUserNotesMarkdown(markdown: string): string {
+  return String(markdown || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+}
+
+function findUserNotesInsertionPoint(markdown: string): number {
+  const normalized = markdown.replace(/\r\n/g, "\n");
+  let cursor = 0;
+  if (normalized.startsWith("---\n")) {
+    const frontmatterEnd = normalized.indexOf("\n---", 4);
+    if (frontmatterEnd !== -1) cursor = frontmatterEnd + "\n---".length;
+  }
+
+  const metadataEnd = normalized.indexOf(MANAGED_BLOCK_END);
+  if (metadataEnd !== -1) cursor = Math.max(cursor, metadataEnd + MANAGED_BLOCK_END.length);
+
+  const nativeEnd = normalized.indexOf(NATIVE_NOTES_BLOCK_END);
+  if (nativeEnd !== -1) cursor = Math.max(cursor, nativeEnd + NATIVE_NOTES_BLOCK_END.length);
+
+  while (cursor < normalized.length && /\s/.test(normalized[cursor] || "")) cursor += 1;
+  return cursor;
 }
 
 export function hasNativeNotesBlock(markdown: string): boolean {
