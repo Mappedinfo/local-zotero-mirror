@@ -3,6 +3,7 @@ export * from "./current-citations.ts";
 export * from "./editor-citations.ts";
 export * from "./format.ts";
 export * from "./frontmatter.ts";
+export * from "./missing-citations.ts";
 export * from "./obsidian-index.ts";
 export * from "./schema.ts";
 export * from "./sync.ts";

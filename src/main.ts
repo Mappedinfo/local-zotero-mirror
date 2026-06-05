@@ -29,6 +29,8 @@ import {
   dirname,
   findObsidianIndexItemForCitation,
   findPandocCitationGroups,
+  missingCitekeyGuidance,
+  missingCitekeySummary,
   readFrontmatterString,
   readFrontmatterStringArray,
   syncSnapshotToStore,
@@ -470,7 +472,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     span.textContent = group?.rendered || `[missing: ${citekeys.join(", ")}]`;
     span.title = [
       `Zotero citation: ${citekeys.join(", ")}`,
-      missing.length > 0 ? `Missing citekey: ${missing.join(", ")}` : "",
+      missing.length > 0 ? missingCitekeyGuidance(missing, response.source, response.error) : "",
       response.error ? `Citation source warning: ${response.error}` : ""
     ]
       .filter(Boolean)
@@ -664,10 +666,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     }
 
     if (response.missingCitekeys.length > 0) {
-      const missing = document.createElement("p");
-      missing.className = "local-zotero-references-missing";
-      missing.textContent = `Missing Zotero citekeys: ${response.missingCitekeys.join(", ")}`;
-      block.append(missing);
+      block.append(createMissingCitekeyHelp(response.missingCitekeys, response));
     }
 
     const list = document.createElement("ol");
@@ -1031,7 +1030,7 @@ class CitationWidget extends WidgetType {
     span.textContent = this.rendered;
     span.title = [
       `Zotero citation: ${this.metadata.citekeys.join(", ")}`,
-      this.metadata.missing.length > 0 ? `Missing citekey: ${this.metadata.missing.join(", ")}` : "",
+      this.metadata.missing.length > 0 ? missingCitekeyGuidance(this.metadata.missing, this.metadata.source) : "",
       this.metadata.source !== "zotero" && this.metadata.source !== "none"
         ? `Citation source: ${this.metadata.source}`
         : ""
@@ -1100,15 +1099,14 @@ class CurrentCitationsView extends ItemView {
     });
 
     if (!data.response || data.entries.length === 0) {
-      const message = data.missingCitekeys.length > 0
-        ? `缺失 citekey：${data.missingCitekeys.join(", ")}`
-        : "当前文件没有引用文献。";
-      container.createEl("p", {
-        cls: data.missingCitekeys.length > 0
-          ? "local-zotero-current-citations-status is-error"
-          : "local-zotero-current-citations-status",
-        text: message
-      });
+      if (data.missingCitekeys.length > 0) {
+        this.renderMissingCitekeyHelp(container, data.missingCitekeys, data.response || undefined);
+      } else {
+        container.createEl("p", {
+          cls: "local-zotero-current-citations-status",
+          text: "当前文件没有引用文献。"
+        });
+      }
       return;
     }
 
@@ -1120,16 +1118,34 @@ class CurrentCitationsView extends ItemView {
     }
 
     if (data.missingCitekeys.length > 0) {
-      container.createEl("p", {
-        cls: "local-zotero-current-citations-status is-error",
-        text: `缺失 citekey：${data.missingCitekeys.join(", ")}`
-      });
+      this.renderMissingCitekeyHelp(container, data.missingCitekeys, data.response);
     }
 
     const list = container.createEl("div", { cls: "local-zotero-current-citations-list" });
     for (const entry of data.entries) {
       this.renderEntry(list, entry, data.sourcePath);
     }
+  }
+
+  private renderMissingCitekeyHelp(
+    container: HTMLElement,
+    citekeys: string[],
+    response?: ZoteroCitationResponse
+  ): void {
+    const help = container.createEl("div", { cls: "local-zotero-citation-help is-error" });
+    help.createEl("div", { cls: "local-zotero-citation-help-title", text: missingCitekeySummary(citekeys) });
+    const lines = missingCitekeyGuidance(citekeys, response?.source, response?.error).split("\n").slice(1);
+    for (const line of lines) {
+      help.createEl("p", { text: line });
+    }
+    const actions = help.createEl("div", { cls: "local-zotero-citation-help-actions" });
+    const sync = actions.createEl("button", { text: "Sync Zotero Library" });
+    sync.type = "button";
+    sync.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void this.plugin.runSync({ dryRun: false });
+    });
   }
 
   private renderEntry(container: HTMLElement, entry: CurrentCitationPanelEntry, sourcePath: string): void {
@@ -1196,6 +1212,22 @@ class CurrentCitationsView extends ItemView {
   }
 }
 
+
+function createMissingCitekeyHelp(citekeys: string[], response?: ZoteroCitationResponse): HTMLElement {
+  const help = document.createElement("div");
+  help.className = "local-zotero-citation-help is-error";
+  const title = document.createElement("div");
+  title.className = "local-zotero-citation-help-title";
+  title.textContent = missingCitekeySummary(citekeys);
+  help.append(title);
+  const lines = missingCitekeyGuidance(citekeys, response?.source, response?.error).split("\n").slice(1);
+  for (const line of lines) {
+    const paragraph = document.createElement("p");
+    paragraph.textContent = line;
+    help.append(paragraph);
+  }
+  return help;
+}
 
 function citationLookupKeys(entry: ZoteroCitationItem): Set<string> {
   return new Set([

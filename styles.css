@@ -121,3 +121,29 @@
   cursor: not-allowed;
   opacity: 0.45;
 }
+
+.local-zotero-citation-help {
+  border-left: 3px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin: 0.5rem 0 0.75rem;
+  padding: 0.35rem 0 0.35rem 0.65rem;
+}
+
+.local-zotero-citation-help.is-error {
+  border-left-color: var(--text-error);
+}
+
+.local-zotero-citation-help-title {
+  color: var(--text-error);
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.local-zotero-citation-help p {
+  margin: 0.2rem 0;
+}
+
+.local-zotero-citation-help-actions {
+  margin-top: 0.45rem;
+}
