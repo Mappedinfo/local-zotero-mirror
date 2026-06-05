@@ -1,5 +1,6 @@
 export * from "./citations.ts";
 export * from "./current-citations.ts";
+export * from "./citation-exports.ts";
 export * from "./editor-citations.ts";
 export * from "./format.ts";
 export * from "./frontmatter.ts";

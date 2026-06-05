@@ -21,7 +21,9 @@ import {
   DEFAULT_SYNC_SETTINGS,
   OBSIDIAN_ZOTERO_INDEX_FILE_NAME,
   OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME,
+  BIBTEX_EXPORT_MARKER,
   assertZoteroSnapshot,
+  buildBibtexExportFile,
   buildCitationRenderRanges,
   buildObsidianIndexFromNotes,
   citationActionState,
@@ -30,6 +32,8 @@ import {
   findObsidianIndexItemForCitation,
   extractUserNotesMarkdown,
   findPandocCitationGroups,
+  formatApaReferenceList,
+  formatBibtexEntries,
   hasUserNotesBlock,
   hashObsidianUserNotes,
   mergeManagedFrontmatter,
@@ -56,6 +60,7 @@ import {
 
 type ZoteroUriField = "zotero_uri" | "pdf_uri";
 type ElectronShell = { openExternal: (uri: string) => Promise<void> };
+type ElectronClipboard = { writeText: (text: string) => void };
 
 interface CitationDocumentState {
   sourcePath: string;
@@ -168,6 +173,24 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "copy-current-citations-apa",
+      name: "Copy Current Citations as APA 7th",
+      callback: () => this.copyCurrentCitationsAsApa()
+    });
+
+    this.addCommand({
+      id: "copy-current-citations-bibtex",
+      name: "Copy Current Citations as BibTeX",
+      callback: () => this.copyCurrentCitationsAsBibtex()
+    });
+
+    this.addCommand({
+      id: "save-current-citations-bibtex-file",
+      name: "Save Current Citations BibTeX File",
+      callback: () => this.saveCurrentCitationsBibtexFile()
+    });
+
+    this.addCommand({
       id: "sync-current-obsidian-note-to-zotero",
       name: "Sync Current Obsidian Note to Zotero",
       callback: () => this.syncCurrentObsidianNoteToZotero()
@@ -274,6 +297,100 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       noFileMessage: "No active note.",
       missingLinkMessage: "This note has no Zotero PDF link."
     });
+  }
+
+  async copyCurrentCitationsAsApa(): Promise<void> {
+    const data = await this.getCurrentCitationsPanelData();
+    const result = formatApaReferenceList(data.response);
+    if (!result.text) {
+      new Notice(result.warnings[0] || "当前文件没有可复制的 APA references。");
+      return;
+    }
+    try {
+      await writeClipboardText(result.text);
+      new Notice(`已复制 ${result.count} 条 APA references。`);
+      this.showCitationExportWarnings(result.warnings);
+    } catch (error) {
+      new Notice(`复制 APA references 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async copyCurrentCitationsAsBibtex(): Promise<void> {
+    const data = await this.getCurrentCitationsPanelData();
+    const result = formatBibtexEntries(data.response);
+    if (!result.text) {
+      new Notice(result.warnings[0] || "当前文件没有可复制的 BibTeX entries。");
+      return;
+    }
+    try {
+      await writeClipboardText(result.text);
+      new Notice(`已复制 ${result.count} 条 BibTeX entries。`);
+      this.showCitationExportWarnings(result.warnings);
+    } catch (error) {
+      new Notice(`复制 BibTeX 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async saveCurrentCitationsBibtexFile(): Promise<void> {
+    const data = await this.getCurrentCitationsPanelData();
+    if (!data.file) {
+      new Notice("当前没有打开 Markdown 文件。");
+      return;
+    }
+    const result = buildBibtexExportFile({
+      sourcePath: data.sourcePath,
+      generatedAt: new Date().toISOString(),
+      response: data.response
+    });
+    if (!result.text) {
+      new Notice(result.warnings[0] || "当前文件没有可保存的 BibTeX entries。");
+      return;
+    }
+
+    try {
+      const path = await this.writeBibtexExportFile(data.file, result.text);
+      new Notice(`已保存 ${result.count} 条 BibTeX entries：${path}`);
+      this.showCitationExportWarnings(result.warnings);
+    } catch (error) {
+      new Notice(`保存 BibTeX 文件失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async writeBibtexExportFile(sourceFile: TFile, content: string): Promise<string> {
+    const folder = dirname(sourceFile.path);
+    const prefix = folder ? `${folder}/` : "";
+    const basePath = normalizePath(`${prefix}${sourceFile.basename}.bib`);
+    const path = await this.resolveBibtexExportPath(basePath);
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFile) {
+      await this.app.vault.modify(existing, content);
+    } else {
+      await this.app.vault.create(path, content);
+    }
+    return path;
+  }
+
+  private async resolveBibtexExportPath(primaryPath: string): Promise<string> {
+    const dot = primaryPath.lastIndexOf(".");
+    const base = dot === -1 ? primaryPath : primaryPath.slice(0, dot);
+    const extension = dot === -1 ? ".bib" : primaryPath.slice(dot);
+    const candidates = [primaryPath];
+    for (let index = 0; index < 100; index += 1) {
+      candidates.push(index === 0 ? `${base}.local-zotero${extension}` : `${base}.local-zotero-${index + 1}${extension}`);
+    }
+
+    for (const candidate of candidates.map((path) => normalizePath(path))) {
+      const existing = this.app.vault.getAbstractFileByPath(candidate);
+      if (!(existing instanceof TFile)) return candidate;
+      const existingContent = await this.app.vault.cachedRead(existing);
+      if (existingContent.startsWith(BIBTEX_EXPORT_MARKER)) return candidate;
+    }
+    throw new Error("无法找到安全的 .bib 导出路径。");
+  }
+
+  private showCitationExportWarnings(warnings: string[]): void {
+    if (warnings.length === 0) return;
+    new Notice(warnings.join("\n"));
   }
 
   registerEditorView(view: EditorView): void {
@@ -1314,6 +1431,8 @@ class CurrentCitationsView extends ItemView {
       });
     }
 
+    this.renderExportActions(container, data);
+
     if (!data.response || data.entries.length === 0) {
       if (data.missingCitekeys.length > 0) {
         this.renderMissingCitekeyHelp(container, data.missingCitekeys, data.response || undefined);
@@ -1341,6 +1460,33 @@ class CurrentCitationsView extends ItemView {
     for (const entry of data.entries) {
       this.renderEntry(list, entry, data.sourcePath);
     }
+  }
+
+  private renderExportActions(container: HTMLElement, data: CurrentCitationsPanelData): void {
+    const apa = formatApaReferenceList(data.response);
+    const bibtex = formatBibtexEntries(data.response);
+    const actions = container.createEl("div", { cls: "local-zotero-current-citations-export-actions" });
+    this.addExportButton(
+      actions,
+      "Copy APA",
+      Boolean(apa.text),
+      apa.text ? `复制 ${apa.count} 条 APA references` : apa.warnings[0] || "当前文件没有可复制的 APA references。",
+      () => this.plugin.copyCurrentCitationsAsApa()
+    );
+    this.addExportButton(
+      actions,
+      "Copy BibTeX",
+      Boolean(bibtex.text),
+      bibtex.text ? `复制 ${bibtex.count} 条 BibTeX entries` : bibtex.warnings[0] || "当前文件没有可复制的 BibTeX entries。",
+      () => this.plugin.copyCurrentCitationsAsBibtex()
+    );
+    this.addExportButton(
+      actions,
+      "Save .bib",
+      Boolean(data.file && bibtex.text),
+      bibtex.text ? `在当前 note 旁保存 ${bibtex.count} 条 BibTeX entries` : bibtex.warnings[0] || "当前文件没有可保存的 BibTeX entries。",
+      () => this.plugin.saveCurrentCitationsBibtexFile()
+    );
   }
 
   private renderMissingCitekeyHelp(
@@ -1421,6 +1567,31 @@ class CurrentCitationsView extends ItemView {
       event.stopPropagation();
       if (!state.enabled) {
         new Notice(state.title);
+        return;
+      }
+      void onClick();
+    });
+  }
+
+  private addExportButton(
+    container: HTMLElement,
+    label: string,
+    enabled: boolean,
+    title: string,
+    onClick: () => Promise<void>
+  ): void {
+    const button = container.createEl("button", {
+      cls: "local-zotero-current-citation-action local-zotero-current-citations-export-action",
+      text: label
+    });
+    button.type = "button";
+    button.disabled = !enabled;
+    button.title = title;
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!enabled) {
+        new Notice(title);
         return;
       }
       void onClick();
@@ -1509,10 +1680,39 @@ async function openExternalUri(uri: string | undefined, missingMessage: string):
   }
 }
 
+async function writeClipboardText(text: string): Promise<void> {
+  let clipboardError: unknown;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch (error) {
+    clipboardError = error;
+  }
+
+  const electronClipboard = getElectronClipboard();
+  if (electronClipboard) {
+    electronClipboard.writeText(text);
+    return;
+  }
+
+  throw clipboardError instanceof Error ? clipboardError : new Error("系统剪贴板不可用。");
+}
+
 function getElectronShell(): ElectronShell | null {
   try {
     const electron = require("electron") as { shell?: ElectronShell };
     return electron.shell ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function getElectronClipboard(): ElectronClipboard | null {
+  try {
+    const electron = require("electron") as { clipboard?: ElectronClipboard };
+    return electron.clipboard ?? null;
   } catch {
     return null;
   }

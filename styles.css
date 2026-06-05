@@ -77,6 +77,13 @@
   gap: 0.75rem;
 }
 
+.local-zotero-current-citations-export-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0 0 0.75rem;
+}
+
 .local-zotero-current-citation-item {
   border-bottom: 1px solid var(--background-modifier-border);
   padding-bottom: 0.75rem;
