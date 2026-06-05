@@ -27,6 +27,8 @@ import {
   dirname,
   findObsidianIndexItemForCitation,
   findPandocCitationGroups,
+  readFrontmatterString,
+  readFrontmatterStringArray,
   syncSnapshotToStore,
   uniqueCitationGroups,
   type DeleteBehavior,
@@ -324,8 +326,11 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       return { file, sourcePath: file.path, response: null, entries: [], missingCitekeys: [] };
     }
 
-    const index = await this.readObsidianIndex().catch(() => null);
-    const entries = response.entries.map((entry) => this.enrichCitationPanelEntry(entry, index));
+    const index = await this.readObsidianIndex().catch((error) => {
+      console.warn("[local-zotero-mirror] Failed to read Obsidian Zotero index", error);
+      return null;
+    });
+    const entries = await Promise.all(response.entries.map((entry) => this.enrichCitationPanelEntry(entry, index)));
     return {
       file,
       sourcePath: file.path,
@@ -376,20 +381,20 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     }
   }
 
-  private enrichCitationPanelEntry(
+  private async enrichCitationPanelEntry(
     entry: ZoteroCitationItem,
     index: ZoteroObsidianIndex | null
-  ): CurrentCitationPanelEntry {
+  ): Promise<CurrentCitationPanelEntry> {
     const indexItem = findObsidianIndexItemForCitation(entry, index);
     const notePath = entry.path || indexItem?.path;
-    const noteFile = notePath ? this.getMarkdownFile(notePath) : null;
+    const noteFile = notePath ? this.getMarkdownFile(notePath) : await this.findCitationPaperNote(entry);
     return {
       citekey: entry.citekey,
       title: entry.title,
       apaReference: entry.citation.apaReference,
-      notePath,
-      zoteroUri: indexItem?.zoteroUri || (noteFile ? this.getFrontmatterUri(noteFile, "zotero_uri") || undefined : undefined),
-      pdfUri: noteFile ? this.getFrontmatterUri(noteFile, "pdf_uri") || undefined : undefined
+      notePath: notePath || noteFile?.path,
+      zoteroUri: indexItem?.zoteroUri || (noteFile ? await this.getFrontmatterUriFromFile(noteFile, "zotero_uri") || undefined : undefined),
+      pdfUri: noteFile ? await this.getFrontmatterUriFromFile(noteFile, "pdf_uri") || undefined : undefined
     };
   }
 
@@ -674,8 +679,16 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
   private async readObsidianIndex(): Promise<ZoteroObsidianIndex | null> {
     const path = normalizePath(`${this.settings.targetFolder}/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`);
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return null;
-    return JSON.parse(await this.app.vault.read(file)) as ZoteroObsidianIndex;
+    if (file instanceof TFile) {
+      return JSON.parse(await this.app.vault.read(file)) as ZoteroObsidianIndex;
+    }
+
+    if (await this.app.vault.adapter.exists(path)) {
+      return JSON.parse(await this.app.vault.adapter.read(path)) as ZoteroObsidianIndex;
+    }
+
+    console.warn("[local-zotero-mirror] Obsidian Zotero index not found", { path });
+    return null;
   }
 
   private registerContextMenus(): void {
@@ -743,6 +756,36 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
   private getFrontmatterUri(file: TFile, field: ZoteroUriField): string | null {
     const uri = this.app.metadataCache.getFileCache(file)?.frontmatter?.[field];
     return typeof uri === "string" && uri.length > 0 ? uri : null;
+  }
+
+  private async getFrontmatterUriFromFile(file: TFile, field: ZoteroUriField): Promise<string | null> {
+    const cached = this.getFrontmatterUri(file, field);
+    if (cached) return cached;
+    const markdown = await this.app.vault.cachedRead(file);
+    return readFrontmatterString(markdown, field) ?? null;
+  }
+
+  private async findCitationPaperNote(entry: ZoteroCitationItem): Promise<TFile | null> {
+    const keys = citationLookupKeys(entry);
+    const papersRoot = normalizePath(`${this.settings.targetFolder}/${this.settings.papersFolderName}`);
+    const files = this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(`${papersRoot}/`));
+
+    for (const file of files) {
+      const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      if (frontmatter && frontmatterMatchesCitation(frontmatter, keys)) return file;
+    }
+
+    for (const file of files) {
+      const markdown = await this.app.vault.cachedRead(file);
+      if (markdownFrontmatterMatchesCitation(markdown, keys)) return file;
+    }
+
+    console.warn("[local-zotero-mirror] Could not resolve local note for citation", {
+      itemKey: entry.itemKey,
+      citekey: entry.citekey,
+      aliases: entry.citation.aliases ?? []
+    });
+    return null;
   }
 
   private getMarkdownFile(path: string): TFile | null {
@@ -1049,6 +1092,33 @@ class CurrentCitationsView extends ItemView {
   }
 }
 
+
+function citationLookupKeys(entry: ZoteroCitationItem): Set<string> {
+  return new Set([
+    entry.itemKey,
+    entry.citekey,
+    entry.citation.citekey,
+    ...(entry.citation.aliases ?? [])
+  ].filter((key): key is string => typeof key === "string" && key.length > 0));
+}
+
+function frontmatterMatchesCitation(frontmatter: Record<string, unknown>, keys: Set<string>): boolean {
+  const candidates = [
+    frontmatter.zotero_key,
+    frontmatter.citekey,
+    ...(Array.isArray(frontmatter.citation_aliases) ? frontmatter.citation_aliases : [])
+  ];
+  return candidates.some((candidate) => typeof candidate === "string" && keys.has(candidate));
+}
+
+function markdownFrontmatterMatchesCitation(markdown: string, keys: Set<string>): boolean {
+  const candidates = [
+    readFrontmatterString(markdown, "zotero_key"),
+    readFrontmatterString(markdown, "citekey"),
+    ...(readFrontmatterStringArray(markdown, "citation_aliases") ?? [])
+  ];
+  return candidates.some((candidate) => candidate && keys.has(candidate));
+}
 
 async function openExternalUri(uri: string | undefined, missingMessage: string): Promise<void> {
   if (!uri) {
