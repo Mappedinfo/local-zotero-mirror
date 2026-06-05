@@ -20,6 +20,7 @@ import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, typ
 import {
   DEFAULT_SYNC_SETTINGS,
   OBSIDIAN_ZOTERO_INDEX_FILE_NAME,
+  OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME,
   assertZoteroSnapshot,
   buildCitationRenderRanges,
   buildObsidianIndexFromNotes,
@@ -89,6 +90,7 @@ const DEFAULT_SETTINGS: ConnectorSettings = {
 
 const CURRENT_CITATIONS_VIEW_TYPE = "local-zotero-current-citations";
 const INTERNAL_ZOTERO_INDEX_FILE_NAME = "zotero-index.json";
+const INTERNAL_ZOTERO_SEARCH_INDEX_FILE_NAME = "zotero-search-index.json";
 const CITATION_WIDGET_CLASS = "local-zotero-editor-citation";
 const citationRenderEffect = StateEffect.define<CitationDocumentState | null>();
 const citationDocumentStateField = StateField.define<CitationDocumentState | null>({
@@ -210,6 +212,9 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
         dryRun: options.dryRun,
         now: new Date().toISOString()
       });
+      if (!options.dryRun) {
+        await this.migrateGeneratedIndexFilesToPluginState();
+      }
 
       const verb = options.dryRun ? "Previewed" : "Synced";
       const summary = `${verb}: ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged, ${result.indexesWritten} indexes.`;
@@ -694,6 +699,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     const legacyIndex = await this.readObsidianIndexAtPath(legacyPath);
     if (legacyIndex) {
       await this.writeObsidianIndex(legacyIndex);
+      await this.removeGeneratedIndexFile(legacyPath);
       console.info("[local-zotero-mirror] Migrated Obsidian Zotero index to plugin state", {
         from: legacyPath,
         to: path
@@ -736,20 +742,53 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     return index;
   }
 
+  private async migrateGeneratedIndexFilesToPluginState(): Promise<void> {
+    await this.migrateGeneratedIndexFile(this.legacyObsidianIndexPath(), this.obsidianIndexPath());
+    await this.migrateGeneratedIndexFile(this.legacyObsidianSearchIndexPath(), this.obsidianSearchIndexPath());
+  }
+
+  private async migrateGeneratedIndexFile(fromPath: string, toPath: string): Promise<boolean> {
+    if (!(await this.app.vault.adapter.exists(fromPath))) return false;
+    const content = await this.app.vault.adapter.read(fromPath);
+    await this.ensurePluginStateDirectory();
+    await this.app.vault.adapter.write(toPath, content.endsWith("\n") ? content : `${content}\n`);
+    await this.removeGeneratedIndexFile(fromPath);
+    console.info("[local-zotero-mirror] Migrated generated index to plugin state", { from: fromPath, to: toPath });
+    return true;
+  }
+
+  private async removeGeneratedIndexFile(path: string): Promise<void> {
+    if (await this.app.vault.adapter.exists(path)) {
+      await this.app.vault.adapter.remove(path);
+    }
+  }
+
   private async writeObsidianIndex(index: ZoteroObsidianIndex): Promise<void> {
+    await this.ensurePluginStateDirectory();
+    await this.app.vault.adapter.write(this.obsidianIndexPath(), `${JSON.stringify(index, null, 2)}\n`);
+  }
+
+  private async ensurePluginStateDirectory(): Promise<void> {
     const directory = this.pluginStateDirectory();
     if (!(await this.app.vault.adapter.exists(directory))) {
       await this.app.vault.adapter.mkdir(directory);
     }
-    await this.app.vault.adapter.write(this.obsidianIndexPath(), `${JSON.stringify(index, null, 2)}\n`);
   }
 
   private obsidianIndexPath(): string {
     return normalizePath(`${this.pluginStateDirectory()}/${INTERNAL_ZOTERO_INDEX_FILE_NAME}`);
   }
 
+  private obsidianSearchIndexPath(): string {
+    return normalizePath(`${this.pluginStateDirectory()}/${INTERNAL_ZOTERO_SEARCH_INDEX_FILE_NAME}`);
+  }
+
   private legacyObsidianIndexPath(): string {
     return normalizePath(`${this.settings.targetFolder}/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`);
+  }
+
+  private legacyObsidianSearchIndexPath(): string {
+    return normalizePath(`${this.settings.targetFolder}/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`);
   }
 
   private pluginStateDirectory(): string {

@@ -1,6 +1,6 @@
 {
   "name": "local-zotero-mirror",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "type": "module",
   "private": true,
   "main": "main.js",
