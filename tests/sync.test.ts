@@ -95,6 +95,44 @@ test("syncSnapshotToStore creates canonical paper notes and collection indexes",
   assert.doesNotMatch(paper, /^tags:\n  - "Health Services Accessibility"/m);
 });
 
+test("syncSnapshotToStore skips writes when only sync timestamps would change", async () => {
+  const store = new MemoryStore();
+  await syncSnapshotToStore(snapshotFixture(), store, DEFAULT_SYNC_SETTINGS, {
+    now: "2026-06-02T00:00:00.000Z"
+  });
+  const before = new Map(store.files);
+
+  const result = await syncSnapshotToStore(snapshotFixture(), store, DEFAULT_SYNC_SETTINGS, {
+    now: "2026-06-03T00:00:00.000Z"
+  });
+
+  assert.equal(result.created, 0);
+  assert.equal(result.updated, 0);
+  assert.equal(result.unchanged, 2);
+  assert.equal(result.indexesWritten, 0);
+  assert.equal(result.obsidianIndexWritten, 0);
+  assert.equal(result.searchIndexWritten, 0);
+  assert.deepEqual(store.files, before);
+});
+
+test("syncSnapshotToStore can write Obsidian indexes directly to plugin state paths", async () => {
+  const store = new MemoryStore();
+  const settings = {
+    ...DEFAULT_SYNC_SETTINGS,
+    obsidianIndexPath: ".obsidian/plugins/local-zotero-mirror/zotero-index.json",
+    obsidianSearchIndexPath: ".obsidian/plugins/local-zotero-mirror/zotero-search-index.json"
+  };
+
+  await syncSnapshotToStore(snapshotFixture(), store, settings, {
+    now: "2026-06-02T00:00:00.000Z"
+  });
+
+  assert.ok(store.files.has(".obsidian/plugins/local-zotero-mirror/zotero-index.json"));
+  assert.ok(store.files.has(".obsidian/plugins/local-zotero-mirror/zotero-search-index.json"));
+  assert.equal(store.files.has(`Zotero/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`), false);
+  assert.equal(store.files.has(`Zotero/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`), false);
+});
+
 test("syncSnapshotToStore creates and migrates explicit Obsidian user note blocks", async () => {
   const store = new MemoryStore();
   await syncSnapshotToStore(snapshotFixture(), store, DEFAULT_SYNC_SETTINGS, {
@@ -136,7 +174,8 @@ test("syncSnapshotToStore preserves user note sections on repeat sync", async ()
     now: "2026-06-03T00:00:00.000Z"
   });
 
-  assert.equal(result.updated, 2);
+  assert.equal(result.updated, 1);
+  assert.equal(result.unchanged, 1);
   assert.match(store.files.get(path)!, /title: "Multi Collection Paper Revised"/);
   assert.match(store.files.get(path)!, /My long hand-written note\./);
   const searchIndex = JSON.parse(store.files.get(`Zotero/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`)!);

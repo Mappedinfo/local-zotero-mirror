@@ -104,6 +104,8 @@ export interface SyncSettings {
   filenameTemplate: string;
   libraryScope: LibraryScope;
   deleteBehavior: DeleteBehavior;
+  obsidianIndexPath?: string;
+  obsidianSearchIndexPath?: string;
 }
 
 export interface SyncOptions {

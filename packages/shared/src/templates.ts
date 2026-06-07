@@ -139,7 +139,7 @@ export function upsertManagedBlock(markdown: string, block: string): string {
   const endIndex = markdown.indexOf(MANAGED_BLOCK_END);
 
   if (startIndex !== -1 && endIndex !== -1 && endIndex > startIndex) {
-    const before = markdown.slice(0, startIndex).replace(/\n*$/, "\n");
+    const before = markdown.slice(0, startIndex).replace(/\n*$/, "\n\n");
     const after = markdown.slice(endIndex + MANAGED_BLOCK_END.length).replace(/^\n*/, "\n\n");
     return `${before}${block}${after}`.replace(/\n+$/, "\n");
   }
@@ -147,7 +147,7 @@ export function upsertManagedBlock(markdown: string, block: string): string {
   const frontmatterEnd = markdown.startsWith("---\n") ? markdown.indexOf("\n---", 4) : -1;
   if (frontmatterEnd !== -1) {
     const insertionPoint = frontmatterEnd + "\n---".length;
-    const before = markdown.slice(0, insertionPoint).replace(/\n*$/, "\n");
+    const before = markdown.slice(0, insertionPoint).replace(/\n*$/, "\n\n");
     const after = markdown.slice(insertionPoint).replace(/^\n*/, "\n\n");
     return `${before}${block}${after}`.replace(/\n+$/, "\n");
   }

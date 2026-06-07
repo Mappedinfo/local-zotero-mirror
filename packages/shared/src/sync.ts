@@ -103,11 +103,13 @@ export async function syncSnapshotToStore(
     const path = notePathsByItemKey.get(item.key)!;
     const collectionLabels = labelsForItem(item, collectionLabelsByKey);
     const itemNativeNotes = nativeNotesByParentItemKey.get(item.key) ?? [];
-    const nextContent = existing
-      ? mergeExistingPaperNote(existing.content, item, now, collectionLabels, false, itemNativeNotes)
-      : itemNativeNotes.length > 0
-        ? renderNewPaperNoteWithNativeNotes(item, now, collectionLabels, itemNativeNotes)
-        : renderNewPaperNote(item, now, collectionLabels);
+    const renderContent = (syncTime: string) =>
+      existing
+        ? mergeExistingPaperNote(existing.content, item, syncTime, collectionLabels, false, itemNativeNotes)
+        : itemNativeNotes.length > 0
+          ? renderNewPaperNoteWithNativeNotes(item, syncTime, collectionLabels, itemNativeNotes)
+          : renderNewPaperNote(item, syncTime, collectionLabels);
+    const nextContent = existing ? preserveTimestampOnlyPaperNote(existing.content, renderContent, now) : renderContent(now);
     noteContentsByPath.set(path, nextContent);
 
     if (!existing) {
@@ -204,7 +206,11 @@ export function normalizeSettings(settings: Partial<SyncSettings>): SyncSettings
       settings.archiveDeletedFolderName || DEFAULT_SYNC_SETTINGS.archiveDeletedFolderName
     ),
     filenameTemplate: settings.filenameTemplate || DEFAULT_SYNC_SETTINGS.filenameTemplate,
-    deleteBehavior: settings.deleteBehavior || DEFAULT_SYNC_SETTINGS.deleteBehavior
+    deleteBehavior: settings.deleteBehavior || DEFAULT_SYNC_SETTINGS.deleteBehavior,
+    obsidianIndexPath: settings.obsidianIndexPath ? normalizeVaultPath(settings.obsidianIndexPath) : undefined,
+    obsidianSearchIndexPath: settings.obsidianSearchIndexPath
+      ? normalizeVaultPath(settings.obsidianSearchIndexPath)
+      : undefined
   };
 }
 
@@ -275,6 +281,61 @@ async function writeIfNeeded(store: NoteStore, path: string, content: string, dr
     await store.ensureFolder(folder);
   }
   await store.write(path, content);
+}
+
+async function writeIfChanged(store: NoteStore, path: string, content: string, dryRun: boolean): Promise<boolean> {
+  if ((await store.read(path)) === content) return false;
+  await writeIfNeeded(store, path, content, dryRun);
+  return true;
+}
+
+async function writeJsonIfMeaningfullyChanged(
+  store: NoteStore,
+  path: string,
+  content: string,
+  normalize: (content: string) => string,
+  dryRun: boolean
+): Promise<boolean> {
+  const existing = await store.read(path);
+  if (existing !== null && normalize(existing) === normalize(content)) return false;
+  await writeIfNeeded(store, path, content, dryRun);
+  return true;
+}
+
+function preserveTimestampOnlyPaperNote(
+  existing: string,
+  renderContent: (syncTime: string) => string,
+  now: string
+): string {
+  const next = renderContent(now);
+  if (next === existing) return next;
+  const previousSyncTime = readFrontmatterString(existing, "last_synced");
+  if (!previousSyncTime) return next;
+  return renderContent(previousSyncTime) === existing ? existing : next;
+}
+
+function preserveTimestampOnlyStandaloneNativeNote(
+  existing: string,
+  renderContent: (syncTime: string) => string,
+  now: string
+): string {
+  const next = renderContent(now);
+  if (next === existing) return next;
+  const previousSyncTime = readFrontmatterString(existing, "last_synced");
+  if (!previousSyncTime) return next;
+  return renderContent(previousSyncTime) === existing ? existing : next;
+}
+
+function preserveTimestampOnlyCollectionIndex(
+  existing: string,
+  renderContent: (syncTime: string) => string,
+  now: string
+): string {
+  const next = renderContent(now);
+  if (next === existing) return next;
+  const previousSyncTime = readFrontmatterString(existing, "last_synced");
+  if (!previousSyncTime) return next;
+  return renderContent(previousSyncTime) === existing ? existing : next;
 }
 
 async function handleDeletedItems(args: {
@@ -352,7 +413,11 @@ async function writeStandaloneNativeNotes(args: {
     standaloneNotePathsByKey.set(note.key, path);
 
     const nextContent = existing
-      ? mergeExistingStandaloneNativeNote(existing.content, note, now, false)
+      ? preserveTimestampOnlyStandaloneNativeNote(
+          existing.content,
+          (syncTime) => mergeExistingStandaloneNativeNote(existing.content, note, syncTime, false),
+          now
+        )
       : renderNewStandaloneNativeNote(note, now);
     noteContentsByPath.set(path, nextContent);
 
@@ -401,10 +466,13 @@ async function writeCollectionIndexes(args: {
       .map((key) => itemsByKey.get(key))
       .filter((item): item is ZoteroItem => Boolean(item));
     const indexPath = ensureUniquePath(collectionIndexPath(settings, collection), usedIndexPaths);
-    const content = renderCollectionIndex(collection, members, notePathsByItemKey, now);
-    result.indexesWritten += 1;
-    result.operations.push({ action: "write-index", path: indexPath, collectionKey: collection.key });
-    await writeIfNeeded(store, indexPath, content, dryRun);
+    const renderContent = (syncTime: string) => renderCollectionIndex(collection, members, notePathsByItemKey, syncTime);
+    const existing = await store.read(indexPath);
+    const content = existing ? preserveTimestampOnlyCollectionIndex(existing, renderContent, now) : renderContent(now);
+    if (await writeIfChanged(store, indexPath, content, dryRun)) {
+      result.indexesWritten += 1;
+      result.operations.push({ action: "write-index", path: indexPath, collectionKey: collection.key });
+    }
   }
 }
 
@@ -476,10 +544,12 @@ async function writeObsidianIndex(args: {
     };
   }
 
-  const path = normalizeVaultPath(`${settings.targetFolder}/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`);
-  result.obsidianIndexWritten += 1;
-  result.operations.push({ action: "write-obsidian-index", path });
-  await writeIfNeeded(store, path, `${JSON.stringify(index, null, 2)}\n`, dryRun);
+  const path = settings.obsidianIndexPath || normalizeVaultPath(`${settings.targetFolder}/${OBSIDIAN_ZOTERO_INDEX_FILE_NAME}`);
+  const content = `${JSON.stringify(index, null, 2)}\n`;
+  if (await writeJsonIfMeaningfullyChanged(store, path, content, normalizeObsidianIndexForComparison, dryRun)) {
+    result.obsidianIndexWritten += 1;
+    result.operations.push({ action: "write-obsidian-index", path });
+  }
 }
 
 async function writeSearchIndex(args: {
@@ -547,10 +617,13 @@ async function writeSearchIndex(args: {
     });
   }
 
-  const path = normalizeVaultPath(`${settings.targetFolder}/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`);
-  result.searchIndexWritten += 1;
-  result.operations.push({ action: "write-search-index", path });
-  await writeIfNeeded(store, path, `${JSON.stringify(searchIndex, null, 2)}\n`, dryRun);
+  const path =
+    settings.obsidianSearchIndexPath || normalizeVaultPath(`${settings.targetFolder}/${OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME}`);
+  const content = `${JSON.stringify(searchIndex, null, 2)}\n`;
+  if (await writeJsonIfMeaningfullyChanged(store, path, content, normalizeSearchIndexForComparison, dryRun)) {
+    result.searchIndexWritten += 1;
+    result.operations.push({ action: "write-search-index", path });
+  }
 }
 
 function normalizeSearchIndexContent(markdown: string): string {
@@ -558,6 +631,48 @@ function normalizeSearchIndexContent(markdown: string): string {
     .normalize("NFKC")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n");
+}
+
+function normalizeObsidianIndexForComparison(content: string): string {
+  return normalizeJsonForComparison(content, (value) => {
+    if (!isRecord(value)) return value;
+    delete value.generatedAt;
+    for (const item of Object.values(asRecord(value.items))) {
+      if (isRecord(item)) delete item.lastSynced;
+    }
+    for (const note of Object.values(asRecord(value.standaloneNotes))) {
+      if (isRecord(note)) delete note.lastSynced;
+    }
+    return value;
+  });
+}
+
+function normalizeSearchIndexForComparison(content: string): string {
+  return normalizeJsonForComparison(content, (value) => {
+    if (!isRecord(value)) return value;
+    delete value.generatedAt;
+    const entries = Array.isArray(value.entries) ? value.entries : [];
+    for (const entry of entries) {
+      if (isRecord(entry)) delete entry.updatedAt;
+    }
+    return value;
+  });
+}
+
+function normalizeJsonForComparison(content: string, transform: (value: unknown) => unknown): string {
+  try {
+    return JSON.stringify(transform(JSON.parse(content)));
+  } catch {
+    return content;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
 }
 
 function collectionIndexPath(settings: SyncSettings, collection: ZoteroCollection): string {

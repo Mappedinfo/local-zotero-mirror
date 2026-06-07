@@ -247,6 +247,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
   async fetchSnapshot(): Promise<ZoteroBridgeSnapshot> {
     const bridgeUrl = new URL(`${trimSlash(this.settings.bridgeUrl)}/snapshot`);
     bridgeUrl.searchParams.set("scope", this.settings.libraryScope);
+    bridgeUrl.searchParams.set("citationMode", "fast");
 
     const snapshot = await fetchBridgeJson<unknown>(bridgeUrl.toString());
     assertZoteroSnapshot(snapshot);
@@ -260,7 +261,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     try {
       const snapshot = await this.fetchSnapshot();
       const store = new ObsidianNoteStore(this.app);
-      const result = await syncSnapshotToStore(snapshot, store, this.settings, {
+      const result = await syncSnapshotToStore(snapshot, store, this.syncSettingsWithInternalIndexes(), {
         dryRun: options.dryRun,
         now: new Date().toISOString()
       });
@@ -1222,6 +1223,14 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     return file instanceof TFile && file.extension === "md" ? file : null;
   }
 
+  private syncSettingsWithInternalIndexes(): ConnectorSettings {
+    return {
+      ...this.settings,
+      obsidianIndexPath: this.obsidianIndexPath(),
+      obsidianSearchIndexPath: this.obsidianSearchIndexPath()
+    };
+  }
+
   private getActiveMarkdownText(file: TFile): string | null {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     return view?.file?.path === file.path ? view.getViewData() : null;
@@ -1764,12 +1773,16 @@ class ObsidianNoteStore implements NoteStore {
   }
 
   async read(path: string): Promise<string | null> {
-    const file = this.getFile(path);
-    return file ? this.app.vault.read(file) : null;
+    const normalized = normalizePath(path);
+    const file = this.getFile(normalized);
+    if (file) return this.app.vault.read(file);
+    return (await this.app.vault.adapter.exists(normalized)) ? this.app.vault.adapter.read(normalized) : null;
   }
 
   async exists(path: string): Promise<boolean> {
-    return this.app.vault.getAbstractFileByPath(normalizePath(path)) !== null;
+    const normalized = normalizePath(path);
+    if (this.app.vault.getAbstractFileByPath(normalized) !== null) return true;
+    return this.app.vault.adapter.exists(normalized);
   }
 
   async ensureFolder(path: string): Promise<void> {
@@ -1792,6 +1805,12 @@ class ObsidianNoteStore implements NoteStore {
       await this.app.vault.modify(file, content);
       return;
     }
+    if (isHiddenVaultPath(normalized)) {
+      const folder = dirname(normalized);
+      if (folder) await this.ensureAdapterFolder(folder);
+      await this.app.vault.adapter.write(normalized, content);
+      return;
+    }
     const folder = dirname(normalized);
     if (folder) {
       await this.ensureFolder(folder);
@@ -1809,6 +1828,23 @@ class ObsidianNoteStore implements NoteStore {
     const entry = this.app.vault.getAbstractFileByPath(normalizePath(path));
     return entry instanceof TFile ? entry : null;
   }
+
+  private async ensureAdapterFolder(path: string): Promise<void> {
+    const normalized = normalizePath(path);
+    const parts = normalized.split("/").filter(Boolean);
+    let current = "";
+
+    for (const part of parts) {
+      current = current ? `${current}/${part}` : part;
+      if (!(await this.app.vault.adapter.exists(current))) {
+        await this.app.vault.adapter.mkdir(current);
+      }
+    }
+  }
+}
+
+function isHiddenVaultPath(path: string): boolean {
+  return normalizePath(path).split("/").some((part) => part.startsWith("."));
 }
 
 class ConnectorSettingTab extends PluginSettingTab {
