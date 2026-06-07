@@ -2,6 +2,7 @@ import {
   App,
   ItemView,
   MarkdownView,
+  Modal,
   Menu,
   Notice,
   Plugin,
@@ -22,8 +23,11 @@ import {
   OBSIDIAN_ZOTERO_INDEX_FILE_NAME,
   OBSIDIAN_ZOTERO_SEARCH_INDEX_FILE_NAME,
   BIBTEX_EXPORT_MARKER,
+  addCitekeyAlias,
+  applyCitekeyAliasesToSnapshot,
   assertZoteroSnapshot,
   buildBibtexExportFile,
+  buildCitekeyAliasRegistry,
   buildCitationRenderRanges,
   buildObsidianIndexFromNotes,
   citationActionState,
@@ -36,6 +40,9 @@ import {
   formatBibtexEntries,
   hasUserNotesBlock,
   hashObsidianUserNotes,
+  isPoorGeneratedCitekey,
+  rewriteMapFromRegistry,
+  rewritePandocCitekeys,
   mergeManagedFrontmatter,
   missingCitekeyGuidance,
   missingCitekeySummary,
@@ -52,6 +59,7 @@ import {
   type ZoteroBridgeStatus,
   type ZoteroCitationItem,
   type CurrentCitationActionState,
+  type CitekeyAliasRegistry,
   type ZoteroCitationMetadata,
   type ZoteroCitationResponse,
   type ZoteroObsidianIndex,
@@ -79,12 +87,29 @@ interface CurrentCitationPanelEntry {
   pdfUri?: string;
 }
 
+interface MissingCitekeyCandidate {
+  missingCitekey: string;
+  itemKey: string;
+  currentCitekey: string;
+  title: string;
+  apaReference?: string;
+  notePath?: string;
+  reason: string;
+  score: number;
+}
+
+interface MissingCitekeyResolution {
+  citekey: string;
+  candidates: MissingCitekeyCandidate[];
+}
+
 interface CurrentCitationsPanelData {
   file: TFile | null;
   sourcePath: string;
   response: ZoteroCitationResponse | null;
   entries: CurrentCitationPanelEntry[];
   missingCitekeys: string[];
+  missingResolutions: MissingCitekeyResolution[];
   writebackStatus?: string;
 }
 
@@ -104,6 +129,7 @@ const DEFAULT_SETTINGS: ConnectorSettings = {
 const CURRENT_CITATIONS_VIEW_TYPE = "local-zotero-current-citations";
 const INTERNAL_ZOTERO_INDEX_FILE_NAME = "zotero-index.json";
 const INTERNAL_ZOTERO_SEARCH_INDEX_FILE_NAME = "zotero-search-index.json";
+const INTERNAL_CITEKEY_ALIAS_FILE_NAME = "zotero-citekey-aliases.json";
 const CITATION_WIDGET_CLASS = "local-zotero-editor-citation";
 const citationRenderEffect = StateEffect.define<CitationDocumentState | null>();
 const citationDocumentStateField = StateField.define<CitationDocumentState | null>({
@@ -260,18 +286,31 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     this.syncInProgress = true;
     try {
       const snapshot = await this.fetchSnapshot();
+      const now = new Date().toISOString();
+      const previousIndex = await this.getOrBuildObsidianIndex();
+      const previousAliases = await this.readCitekeyAliasRegistry();
+      const aliasRegistry = buildCitekeyAliasRegistry(snapshot, previousIndex, previousAliases, now);
+      const snapshotWithAliases = applyCitekeyAliasesToSnapshot(snapshot, aliasRegistry);
+      this.lastSnapshot = snapshotWithAliases;
+      this.citationCache.clear();
       const store = new ObsidianNoteStore(this.app);
-      const result = await syncSnapshotToStore(snapshot, store, this.syncSettingsWithInternalIndexes(), {
+      const result = await syncSnapshotToStore(snapshotWithAliases, store, this.syncSettingsWithInternalIndexes(), {
         dryRun: options.dryRun,
-        now: new Date().toISOString()
+        now
       });
+      let rewriteSummary = "";
       if (!options.dryRun) {
+        await this.writeCitekeyAliasRegistry(aliasRegistry);
         this.suppressWritebackForPaths(result.operations.map((operation) => operation.path));
         await this.migrateGeneratedIndexFilesToPluginState();
+        const rewriteResult = await this.rewriteConfirmedCitekeysInVault(aliasRegistry);
+        if (rewriteResult.files > 0) {
+          rewriteSummary = ` Rewrote ${rewriteResult.replacements} citation keys in ${rewriteResult.files} files.`;
+        }
       }
 
       const verb = options.dryRun ? "Previewed" : "Synced";
-      const summary = `${verb}: ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged, ${result.indexesWritten} indexes.`;
+      const summary = `${verb}: ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged, ${result.indexesWritten} indexes.${rewriteSummary}`;
       console.info("[local-zotero-mirror]", summary, result.operations);
       if (!options.silent) {
         new Notice(summary);
@@ -473,7 +512,7 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
   async getCurrentCitationsPanelData(): Promise<CurrentCitationsPanelData> {
     const file = this.app.workspace.getActiveFile();
     if (!(file instanceof TFile) || file.extension !== "md") {
-      return { file: null, sourcePath: "", response: null, entries: [], missingCitekeys: [] };
+      return { file: null, sourcePath: "", response: null, entries: [], missingCitekeys: [], missingResolutions: [] };
     }
 
     const markdown = this.getActiveMarkdownText(file) ?? (await this.app.vault.cachedRead(file));
@@ -486,18 +525,21 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
         response: null,
         entries: [],
         missingCitekeys: [],
+        missingResolutions: [],
         writebackStatus: readFrontmatterString(markdown, "obsidian_note_sync_status")
       };
     }
 
     const index = await this.getOrBuildObsidianIndex();
     const entries = await Promise.all(response.entries.map((entry) => this.enrichCitationPanelEntry(entry, index)));
+    const missingResolutions = await this.findMissingCitekeyResolutions(response.missingCitekeys, markdown, index);
     return {
       file,
       sourcePath: file.path,
       response,
       entries,
       missingCitekeys: response.missingCitekeys,
+      missingResolutions,
       writebackStatus: readFrontmatterString(markdown, "obsidian_note_sync_status")
     };
   }
@@ -731,6 +773,96 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     };
   }
 
+  private async findMissingCitekeyResolutions(
+    citekeys: string[],
+    markdown: string,
+    index: ZoteroObsidianIndex | null
+  ): Promise<MissingCitekeyResolution[]> {
+    if (citekeys.length === 0 || !index) return [];
+    const context = normalizeCandidateText(extractCitationResolutionContext(markdown));
+    return citekeys.map((citekey) => {
+      const candidates = Object.values(index.items)
+        .map((item) => this.scoreMissingCitekeyCandidate(citekey, item, context))
+        .filter((candidate): candidate is MissingCitekeyCandidate => Boolean(candidate))
+        .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title))
+        .slice(0, 5);
+      return { citekey, candidates };
+    });
+  }
+
+  private scoreMissingCitekeyCandidate(
+    missingCitekey: string,
+    item: ZoteroObsidianIndex["items"][string],
+    context: string
+  ): MissingCitekeyCandidate | null {
+    const currentCitekey = item.citation?.citekey || item.citekey || item.itemKey;
+    if (isPoorGeneratedCitekey(currentCitekey)) return null;
+
+    const title = normalizeCandidateText(item.title);
+    const reference = normalizeCandidateText(item.citation?.apaReference || "");
+    const year = extractYear(item.citation?.apaReference || currentCitekey || "");
+    let score = 0;
+    const reasons: string[] = [];
+
+    if (title && context.includes(title)) {
+      score += 6;
+      reasons.push("标题匹配");
+    }
+    if (reference && context.includes(reference)) {
+      score += 8;
+      reasons.push("APA reference 匹配");
+    }
+    if (year && context.includes(year)) {
+      score += 1;
+      reasons.push("年份匹配");
+    }
+
+    const author = normalizeCandidateText((item.citation?.apaReference || "").split(/[（(]\d{4}/)[0] || "");
+    if (author && author.length >= 2 && context.includes(author)) {
+      score += 2;
+      reasons.push("作者匹配");
+    }
+
+    if (score < 6) return null;
+    return {
+      missingCitekey,
+      itemKey: item.itemKey,
+      currentCitekey,
+      title: item.title,
+      apaReference: item.citation?.apaReference,
+      notePath: item.path,
+      reason: reasons.join("、") || "上下文匹配",
+      score
+    };
+  }
+
+  async confirmMissingCitekeyCandidate(candidate: MissingCitekeyCandidate): Promise<void> {
+    const now = new Date().toISOString();
+    const registry = (await this.readCitekeyAliasRegistry()) ?? {
+      schemaVersion: 1 as const,
+      generatedAt: now,
+      aliases: {}
+    };
+    addCitekeyAlias(
+      registry,
+      candidate.missingCitekey,
+      {
+        itemKey: candidate.itemKey,
+        currentCitekey: candidate.currentCitekey,
+        title: candidate.title
+      },
+      "confirmed",
+      now
+    );
+    await this.writeCitekeyAliasRegistry(registry);
+    const rewrite = await this.rewriteConfirmedCitekeysInVault(registry);
+    this.citationCache.clear();
+    this.scheduleCurrentCitationsPanelRefresh();
+    new Notice(
+      `已绑定 ${candidate.missingCitekey} -> ${candidate.currentCitekey}。改写 ${rewrite.files} 个文件、${rewrite.replacements} 处引用。`
+    );
+  }
+
   private async renderPandocCitations(element: HTMLElement, context: MarkdownPostProcessorContext): Promise<void> {
     const textNodes = this.collectCitationTextNodes(element);
     const nodeGroups = textNodes
@@ -808,7 +940,8 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
   }
 
   async fetchCitationResponse(groups: string[][]): Promise<ZoteroCitationResponse> {
-    const cacheKey = `${this.settings.libraryScope}:apa:${groups.map(citationGroupKey).join("|")}`;
+    const resolvedGroups = await this.resolveCitationGroupsThroughAliases(groups);
+    const cacheKey = `${this.settings.libraryScope}:apa:${groups.map(citationGroupKey).join("|")}:${resolvedGroups.map(citationGroupKey).join("|")}`;
     const cached = this.citationCache.get(cacheKey);
     if (cached?.source === "zotero") return cached;
 
@@ -818,18 +951,70 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
       const response = await postBridgeJson<ZoteroCitationResponse>(bridgeUrl.toString(), {
         style: "apa",
         scope: this.settings.libraryScope,
-        groups: groups.map((group) => group.join(",")).join("|")
+        groups: resolvedGroups.map((group) => group.join(",")).join("|")
       });
       if (response.groups.length !== groups.length) {
         throw new Error("Zotero bridge returned no citation groups for the requested citekeys.");
       }
-      this.citationCache.set(cacheKey, response);
-      return response;
+      const mapped = this.remapCitationResponseToOriginalGroups(response, groups, resolvedGroups);
+      this.citationCache.set(cacheKey, mapped);
+      return mapped;
     } catch (error) {
       const fallback = await this.buildCitationResponseFromCache(groups, error);
       this.citationCache.set(cacheKey, fallback);
       return fallback;
     }
+  }
+
+  private async resolveCitationGroupsThroughAliases(groups: string[][]): Promise<string[][]> {
+    const registry = await this.readCitekeyAliasRegistry();
+    const index = await this.getOrBuildObsidianIndex();
+    return groups.map((group) =>
+      group.map((citekey) => this.resolveSingleCitekeyThroughAliases(citekey, registry, index))
+    );
+  }
+
+  private resolveSingleCitekeyThroughAliases(
+    citekey: string,
+    registry: CitekeyAliasRegistry | null,
+    index: ZoteroObsidianIndex | null
+  ): string {
+    const registryRecord = registry?.aliases[citekey];
+    if (registryRecord?.currentCitekey) return registryRecord.currentCitekey;
+    if (!index) return citekey;
+
+    for (const item of Object.values(index.items)) {
+      const candidates = [item.itemKey, item.citekey, item.citation?.citekey, ...(item.citation?.aliases ?? [])];
+      if (candidates.includes(citekey)) {
+        return item.citation?.citekey || item.citekey || citekey;
+      }
+    }
+    return citekey;
+  }
+
+  private remapCitationResponseToOriginalGroups(
+    response: ZoteroCitationResponse,
+    originalGroups: string[][],
+    resolvedGroups: string[][]
+  ): ZoteroCitationResponse {
+    const missingResolved = new Set(response.missingCitekeys);
+    const groups = response.groups.map((group, index) => {
+      const original = originalGroups[index] ?? group.citekeys;
+      const resolved = resolvedGroups[index] ?? group.citekeys;
+      const missing = original.filter((_citekey, keyIndex) => missingResolved.has(resolved[keyIndex] ?? _citekey));
+      return {
+        ...group,
+        citekeys: original,
+        missing
+      };
+    });
+    const missingCitekeys = groups.flatMap((group) => group.missing).filter((value, index, all) => all.indexOf(value) === index);
+    return {
+      ...response,
+      groups,
+      missingCitekeys,
+      ok: missingCitekeys.length === 0 && response.entries.length > 0
+    };
   }
 
   private async buildCitationResponseFromCache(groups: string[][], error?: unknown): Promise<ZoteroCitationResponse> {
@@ -866,6 +1051,14 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
           citation
         };
         this.registerCitationEntry(itemsByKey, entry, [item.citekey, item.itemKey]);
+      }
+    }
+
+    const registry = await this.readCitekeyAliasRegistry();
+    if (registry) {
+      for (const record of Object.values(registry.aliases)) {
+        const entry = itemsByKey.get(record.itemKey) || itemsByKey.get(record.currentCitekey);
+        if (entry) this.registerCitationEntry(itemsByKey, entry, [record.alias, record.currentCitekey, record.itemKey]);
       }
     }
 
@@ -1094,6 +1287,50 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
     await this.app.vault.adapter.write(this.obsidianIndexPath(), `${JSON.stringify(index, null, 2)}\n`);
   }
 
+  private async readCitekeyAliasRegistry(): Promise<CitekeyAliasRegistry | null> {
+    const path = this.citekeyAliasRegistryPath();
+    if (!(await this.app.vault.adapter.exists(path))) return null;
+    try {
+      const value = JSON.parse(await this.app.vault.adapter.read(path)) as CitekeyAliasRegistry;
+      return value && value.schemaVersion === 1 && value.aliases ? value : null;
+    } catch (error) {
+      console.warn("[local-zotero-mirror] Failed to read citekey alias registry", error);
+      return null;
+    }
+  }
+
+  private async writeCitekeyAliasRegistry(registry: CitekeyAliasRegistry): Promise<void> {
+    await this.ensurePluginStateDirectory();
+    await this.app.vault.adapter.write(this.citekeyAliasRegistryPath(), `${JSON.stringify(registry, null, 2)}\n`);
+  }
+
+  private async rewriteConfirmedCitekeysInVault(
+    registry: CitekeyAliasRegistry
+  ): Promise<{ files: number; replacements: number; citekeys: string[] }> {
+    const rewriteMap = rewriteMapFromRegistry(registry);
+    if (rewriteMap.size === 0) return { files: 0, replacements: 0, citekeys: [] };
+
+    let files = 0;
+    let replacements = 0;
+    const citekeys = new Set<string>();
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const markdown = await this.app.vault.cachedRead(file);
+      const result = rewritePandocCitekeys(markdown, rewriteMap);
+      if (result.replacements === 0 || result.markdown === markdown) continue;
+      this.suppressWritebackForPaths([file.path]);
+      await this.app.vault.modify(file, result.markdown);
+      files += 1;
+      replacements += result.replacements;
+      for (const key of result.citekeys) citekeys.add(key);
+    }
+
+    if (files > 0) {
+      this.citationCache.clear();
+      this.scheduleCurrentCitationsPanelRefresh();
+    }
+    return { files, replacements, citekeys: [...citekeys] };
+  }
+
   private async ensurePluginStateDirectory(): Promise<void> {
     const directory = this.pluginStateDirectory();
     if (!(await this.app.vault.adapter.exists(directory))) {
@@ -1107,6 +1344,10 @@ export default class ObsidianZoteroConnectorPlugin extends Plugin {
 
   private obsidianSearchIndexPath(): string {
     return normalizePath(`${this.pluginStateDirectory()}/${INTERNAL_ZOTERO_SEARCH_INDEX_FILE_NAME}`);
+  }
+
+  private citekeyAliasRegistryPath(): string {
+    return normalizePath(`${this.pluginStateDirectory()}/${INTERNAL_CITEKEY_ALIAS_FILE_NAME}`);
   }
 
   private legacyObsidianIndexPath(): string {
@@ -1380,6 +1621,62 @@ class CitationWidget extends WidgetType {
   }
 }
 
+class MissingCitekeyResolutionModal extends Modal {
+  constructor(
+    app: App,
+    private readonly plugin: ObsidianZoteroConnectorPlugin,
+    private readonly resolutions: MissingCitekeyResolution[]
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Resolve missing citekeys" });
+    contentEl.createEl("p", {
+      text: "这些候选来自当前 note 的引用上下文和 References。确认后才会绑定并改写 Markdown citation。"
+    });
+
+    const available = this.resolutions.filter((resolution) => resolution.candidates.length > 0);
+    if (available.length === 0) {
+      contentEl.createEl("p", { text: "没有可确认的候选。请先同步 Zotero，或在 Zotero/Better BibTeX 中设置 Citation Key。" });
+      return;
+    }
+
+    for (const resolution of available) {
+      const block = contentEl.createEl("section", { cls: "local-zotero-citekey-resolution" });
+      block.createEl("h3", { text: resolution.citekey });
+      for (const candidate of resolution.candidates) {
+        const item = block.createEl("article", { cls: "local-zotero-citekey-resolution-candidate" });
+        item.createEl("div", {
+          cls: "local-zotero-current-citation-citekey",
+          text: `${candidate.missingCitekey} -> ${candidate.currentCitekey}`
+        });
+        item.createEl("div", { cls: "local-zotero-current-citation-title", text: candidate.title });
+        if (candidate.apaReference) {
+          item.createEl("p", { cls: "local-zotero-current-citation-reference", text: candidate.apaReference });
+        }
+        item.createEl("p", { text: `${candidate.reason}；score ${candidate.score}` });
+        const confirm = item.createEl("button", { text: "Confirm and rewrite" });
+        confirm.type = "button";
+        confirm.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void this.plugin
+            .confirmMissingCitekeyCandidate(candidate)
+            .then(() => this.close())
+            .catch((error) => new Notice(`绑定 citekey 失败：${error instanceof Error ? error.message : String(error)}`));
+        });
+      }
+    }
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 class CurrentCitationsView extends ItemView {
   constructor(leaf: WorkspaceLeaf, private readonly plugin: ObsidianZoteroConnectorPlugin) {
     super(leaf);
@@ -1444,7 +1741,7 @@ class CurrentCitationsView extends ItemView {
 
     if (!data.response || data.entries.length === 0) {
       if (data.missingCitekeys.length > 0) {
-        this.renderMissingCitekeyHelp(container, data.missingCitekeys, data.response || undefined);
+        this.renderMissingCitekeyHelp(container, data.missingCitekeys, data.response || undefined, data.missingResolutions);
       } else {
         container.createEl("p", {
           cls: "local-zotero-current-citations-status",
@@ -1462,7 +1759,7 @@ class CurrentCitationsView extends ItemView {
     }
 
     if (data.missingCitekeys.length > 0) {
-      this.renderMissingCitekeyHelp(container, data.missingCitekeys, data.response);
+      this.renderMissingCitekeyHelp(container, data.missingCitekeys, data.response, data.missingResolutions);
     }
 
     const list = container.createEl("div", { cls: "local-zotero-current-citations-list" });
@@ -1501,7 +1798,8 @@ class CurrentCitationsView extends ItemView {
   private renderMissingCitekeyHelp(
     container: HTMLElement,
     citekeys: string[],
-    response?: ZoteroCitationResponse
+    response?: ZoteroCitationResponse,
+    resolutions: MissingCitekeyResolution[] = []
   ): void {
     const help = container.createEl("div", { cls: "local-zotero-citation-help is-error" });
     help.createEl("div", { cls: "local-zotero-citation-help-title", text: missingCitekeySummary(citekeys) });
@@ -1517,6 +1815,29 @@ class CurrentCitationsView extends ItemView {
       event.stopPropagation();
       void this.plugin.runSync({ dryRun: false });
     });
+    const candidates = resolutions.flatMap((resolution) => resolution.candidates);
+    if (candidates.length > 0) {
+      const resolve = actions.createEl("button", { text: "Resolve missing citekeys" });
+      resolve.type = "button";
+      resolve.title = `找到 ${candidates.length} 个候选，需要确认后才会绑定。`;
+      resolve.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        new MissingCitekeyResolutionModal(this.app, this.plugin, resolutions).open();
+      });
+      for (const resolution of resolutions.filter((entry) => entry.candidates.length > 0)) {
+        const top = resolution.candidates[0];
+        help.createEl("p", {
+          cls: "local-zotero-citation-help-candidate",
+          text: `候选：${resolution.citekey} -> ${top.currentCitekey}（${top.title}；${top.reason}）`
+        });
+      }
+    } else {
+      help.createEl("p", {
+        cls: "local-zotero-citation-help-candidate",
+        text: "没有可自动确认的候选。请先同步 Zotero，或在 Zotero/Better BibTeX 中设置明确 Citation Key。"
+      });
+    }
   }
 
   private renderEntry(container: HTMLElement, entry: CurrentCitationPanelEntry, sourcePath: string): void {
@@ -1616,6 +1937,32 @@ function safeFileToken(value: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 120) || "untitled";
+}
+
+function extractCitationResolutionContext(markdown: string): string {
+  const referencesMatch = markdown.match(/(^|\n)# +References\b[\s\S]*$/i);
+  if (referencesMatch) return referencesMatch[0];
+  const groups = findPandocCitationGroups(markdown);
+  if (groups.length === 0) return markdown.slice(-4000);
+  const snippets = groups.map((group) => {
+    const start = Math.max(0, group.start - 500);
+    const end = Math.min(markdown.length, group.end + 1500);
+    return markdown.slice(start, end);
+  });
+  return `${snippets.join("\n\n")}\n\n${markdown.slice(-4000)}`;
+}
+
+function normalizeCandidateText(value: string): string {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function extractYear(value: string): string | undefined {
+  return String(value || "").match(/\b(19|20)\d{2}\b/)?.[0];
 }
 
 function timestampForFileName(date: Date): string {
@@ -1792,8 +2139,18 @@ class ObsidianNoteStore implements NoteStore {
 
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
-      if (!this.app.vault.getAbstractFileByPath(current)) {
-        await this.app.vault.createFolder(current);
+      const existing = this.app.vault.getAbstractFileByPath(current);
+      if (existing && !(existing instanceof TFile)) continue;
+      if (await this.app.vault.adapter.exists(current)) continue;
+      if (!existing) {
+        try {
+          await this.app.vault.createFolder(current);
+        } catch (error) {
+          const existsAfterError =
+            this.app.vault.getAbstractFileByPath(current) !== null || (await this.app.vault.adapter.exists(current));
+          if (existsAfterError && isAlreadyExistsError(error)) continue;
+          throw error;
+        }
       }
     }
   }
@@ -1815,7 +2172,15 @@ class ObsidianNoteStore implements NoteStore {
     if (folder) {
       await this.ensureFolder(folder);
     }
-    await this.app.vault.create(normalized, content);
+    try {
+      await this.app.vault.create(normalized, content);
+    } catch (error) {
+      if (isAlreadyExistsError(error)) {
+        await this.app.vault.adapter.write(normalized, content);
+        return;
+      }
+      throw error;
+    }
   }
 
   async move(fromPath: string, toPath: string): Promise<void> {
@@ -1845,6 +2210,11 @@ class ObsidianNoteStore implements NoteStore {
 
 function isHiddenVaultPath(path: string): boolean {
   return normalizePath(path).split("/").some((part) => part.startsWith("."));
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /already exists|file exists|folder exists|eexist/i.test(message);
 }
 
 class ConnectorSettingTab extends PluginSettingTab {
